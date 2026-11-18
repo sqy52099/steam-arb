@@ -194,10 +194,36 @@ job 的 `timeout-minutes`（要比 deadline 多 5 分钟以上）。
 cron 也不能比一轮耗时更密：collect(18) + merge(12) 最坏 30 分钟，按 `*/30`
 排刚好。再密就会堆队列，最后全是排队超时的废跑。
 
+## 现在是什么状态（2026-11-18）
+
+**定时采集是关着的**，`schedule` 那三行在 `collect.yml` 里被注释掉了。
+
+原因：从 `2026-11-18T10:02Z` 起连续 8 轮，四个 shard 的 artifact 全是
+386~394 字节（空），health 里 `steam_orders` 一律 `0/x 成功`，报错在
+`429` 和 `HTTP 0` 之间跳。同时刻第三方接口完全正常（合并 6500+ 件）——
+说明是我们自己把 Azure 那段出口打进了限流：每次 push 都触发一轮
+4×120 件采集，8 轮下来请求量远超探测阶段的压测，而 Steam 的限流按 IP
+计、恢复很慢，Azure 的 IP 又是共享的。
+
+**想跑一轮看接口回来没有**：
+
+```
+GitHub → Actions → collect → Run workflow → main → Run
+```
+
+跑完看 Summary 那张表，`Steam 物品页` 那一行是 ✅ 就说明缓过来了，再把
+`collect.yml` 里 `schedule` 的注释去掉，恢复每 30 分钟一轮。还是 ❌ 就先
+别连着点 —— 每点一次都是一整轮 4×120 件的请求，点得越勤恢复越慢。
+
+迟迟不恢复的话，剩下的路是换出口（境外 VPS 跑采集），或者放弃真实求购价、
+改用第三方自报的 Steam 中间价近似（`thirdparty.py` 里的 `steam_mid_cny`
+已经有了，只是不准）。
+
 ## 部署
 
 1. 仓库设成 **public**（私有仓库 Actions 2000 分钟/月会超，光采集就 620 分钟/天）
-2. `git push origin main`，之后 `.github/workflows/collect.yml` 每 30 分钟自动跑
+2. `git push origin main`（`collect.yml` 里 `schedule` 现在是注释状态，
+   见上一节；取消注释后才会每 30 分钟自动跑）
 3. **仓库 Settings → Pages → Source 选 "GitHub Actions"** —— 这一步必须手动做
    一次。workflow 里的 `configure-pages` 虽然传了 `enablement: true`，但
    `GITHUB_TOKEN` 无权创建 Pages 站点（实测 `POST /repos/.../pages` 返 403
