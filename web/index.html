@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Steam 皮肤比价</title>
+<style>
+:root{
+  --bg:#0f1115; --panel:#171a21; --line:#252a34; --txt:#d7dde7; --dim:#7f8794;
+  --up:#4ade80; --down:#f87171; --warn:#fbbf24; --acc:#66c0f4;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+  font:14px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+header{padding:16px 20px 12px;border-bottom:1px solid var(--line);
+  display:flex;gap:16px;align-items:baseline;flex-wrap:wrap}
+h1{font-size:17px;margin:0;font-weight:600}
+.meta{color:var(--dim);font-size:12px}
+.wrap{padding:14px 20px 60px;max-width:1400px;margin:0 auto}
+.filters{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:14px;align-items:flex-end}
+.f{display:flex;flex-direction:column;gap:4px}
+.f label{font-size:11px;color:var(--dim)}
+input,select{background:var(--panel);border:1px solid var(--line);color:var(--txt);
+  padding:6px 8px;border-radius:6px;font:inherit;font-size:13px;width:110px}
+input:focus,select:focus{outline:none;border-color:var(--acc)}
+.btn{background:var(--panel);border:1px solid var(--line);color:var(--txt);
+  padding:7px 12px;border-radius:6px;cursor:pointer;font:inherit;font-size:13px}
+.btn:hover{border-color:var(--acc)}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums}
+th,td{padding:8px 10px;text-align:right;border-bottom:1px solid var(--line);
+  white-space:nowrap}
+th{font-size:11.5px;color:var(--dim);font-weight:500;position:sticky;top:0;
+  background:var(--bg);cursor:pointer;user-select:none}
+th:hover{color:var(--txt)}
+th.name,td.name{text-align:left;white-space:normal;width:99%}
+td.name a{color:var(--txt);text-decoration:none}
+td.name a:hover{color:var(--acc)}
+.ratio{font-weight:600}
+.good{color:var(--up)} .mid{color:var(--warn)} .bad{color:var(--down)}
+.tag{font-size:10.5px;padding:1px 5px;border-radius:4px;border:1px solid var(--line);
+  color:var(--dim);margin-left:6px}
+.ptag{font-size:10.5px;color:var(--acc);border:1px solid #2a4a5e;
+  padding:1px 5px;border-radius:4px;margin-left:6px}
+.empty{padding:40px;text-align:center;color:var(--dim)}
+.legend{margin-top:18px;padding:12px 14px;background:var(--panel);
+  border:1px solid var(--line);border-radius:8px;color:var(--dim);font-size:12px}
+.legend b{color:var(--txt)}
+.warnbar{margin:0 0 14px;padding:10px 14px;border-radius:8px;
+  background:#2a2118;border:1px solid #4a3a1a;color:#e8c98a;font-size:12.5px}
+@media(max-width:760px){
+  .wrap{padding:10px 10px 40px}
+  th,td{padding:7px 6px;font-size:12.5px}
+  .hide-s{display:none}
+  input,select{width:88px}
+}
+</style>
+</head>
+<body>
+<header>
+  <h1>Steam 皮肤比价</h1>
+  <span class="meta" id="stamp">加载中…</span>
+  <span class="meta" id="cnt"></span>
+</header>
+
+<div class="wrap">
+  <div class="warnbar" id="disc"></div>
+
+  <div class="filters">
+    <div class="f"><label>面值比 ≥</label>
+      <input type="number" id="fRatio" step="0.01" value="1.00"></div>
+    <div class="f"><label>成交量 ≥</label>
+      <input type="number" id="fVol" step="10" value="30"></div>
+    <div class="f"><label>买入价 ¥≥</label>
+      <input type="number" id="fMin" step="1" value="3"></div>
+    <div class="f"><label>买入价 ¥≤</label>
+      <input type="number" id="fMax" step="10" value="20000"></div>
+    <div class="f"><label>数据源</label>
+      <select id="fSrc"><option value="">全部</option>
+        <option value="skinport">Skinport</option>
+        <option value="waxpeer">Waxpeer</option></select></div>
+    <div class="f"><label>折现系数</label>
+      <input type="number" id="fDisc" step="0.01" value="0.80" title="余额当现金用大约打这个折"></div>
+    <button class="btn" id="reset">重置</button>
+  </div>
+
+  <table>
+    <thead><tr>
+      <th class="name" data-k="n">物品</th>
+      <th data-k="ratio">面值比</th>
+      <th data-k="real">折现净额</th>
+      <th data-k="buy">买入价</th>
+      <th data-k="net">Steam 净得</th>
+      <th data-k="bid" class="hide-s">求购价</th>
+      <th data-k="sell" class="hide-s">最低挂单</th>
+      <th data-k="vol">24h 成交</th>
+      <th class="hide-s">来源</th>
+    </tr></thead>
+    <tbody id="tb"></tbody>
+  </table>
+  <div class="empty" id="empty" style="display:none">没有符合条件的物品，把筛选放宽一点。</div>
+
+  <div class="legend">
+    <b>面值比</b> = Steam 上卖掉后<span class="good">卖家净得</span> ÷ 第三方买入价（已按 Steam 阶梯手续费精确扣减）。<br>
+    <b>折现净额</b> = Steam 净得 × 折现系数 − 买入价。余额不能直接变成现金，一般只能按 0.75~0.85 用掉，
+    所以面值比 &gt; 1 也可能是亏的。<br>
+    数据来自 Steam 社区市场公开接口与第三方站点，<b>有 5～15 分钟延迟</b>，
+    下单前请点物品名去官方页面核对实时价格。
+  </div>
+</div>
+
+<script>
+const DISC_DEFAULT = 0.80;
+let RAW = [], SORT = {k:'ratio', dir:-1};
+
+const $ = id => document.getElementById(id);
+const fmt = (v, d=2) => (v===null||v===undefined||!isFinite(v)) ? '—' : v.toFixed(d);
+const el = (t,c,txt) => { const e=document.createElement(t); if(c)e.className=c;
+  if(txt!==undefined)e.textContent=txt; return e; };
+
+function steamUrl(name){
+  return 'https://steamcommunity.com/market/listings/730/'+encodeURIComponent(name);
+}
+
+async function load(){
+  // 优先读构建时同目录的 latest.json；允许 ?api=xxx 覆盖
+  const q = new URLSearchParams(location.search);
+  const src = q.get('api') || 'data/latest.json';
+  try{
+    const r = await fetch(src, {cache:'no-store'});
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    const j = await r.json();
+    RAW = j.items || [];
+    $('stamp').textContent = '数据时间 ' +
+      new Date(j.generated*1000).toLocaleString('zh-CN',{hour12:false});
+    $('cnt').textContent = `${RAW.length} 件`;
+    $('disc').textContent = j.note || '';
+  }catch(e){
+    $('stamp').textContent = '数据加载失败：' + e.message;
+    $('disc').textContent = '找不到 data/latest.json。本地预览先跑：'
+      + 'python collector/run.py --fake';
+  }
+  render();
+}
+
+function disc(){ const v = parseFloat($('fDisc').value); return isFinite(v)? v : DISC_DEFAULT; }
+
+function view(){
+  const rMin = parseFloat($('fRatio').value) || 0;
+  const vMin = parseFloat($('fVol').value) || 0;
+  const pMin = parseFloat($('fMin').value) || 0;
+  const pMax = parseFloat($('fMax').value) || Infinity;
+  const src  = $('fSrc').value;
+  const d = disc();
+  return RAW
+    .filter(it => (it.ratio ?? 0) >= rMin
+               && (it.vol ?? 0) >= vMin
+               && (it.buy ?? 0) >= pMin && (it.buy ?? 0) <= pMax
+               && (!src || it.src === src))
+    .map(it => ({...it,
+      real: (it.net != null && it.buy != null) ? it.net*d - it.buy : null}))
+    .sort((a,b) => {
+      const k = SORT.k, va = a[k] ?? -Infinity, vb = b[k] ?? -Infinity;
+      if(typeof va === 'string' || typeof vb === 'string')
+        return String(va).localeCompare(String(vb)) * SORT.dir;
+      return (va - vb) * SORT.dir;
+    });
+}
+
+function render(){
+  const rows = view(), tb = $('tb');
+  tb.textContent = '';
+  $('empty').style.display = rows.length ? 'none' : 'block';
+  const frag = document.createDocumentFragment();
+  for(const it of rows){
+    const tr = el('tr');
+    // 物品名 + 去 Steam 的链接
+    const tdN = el('td','name');
+    const a = el('a', null, it.n); a.href = steamUrl(it.n);
+    a.target = '_blank'; a.rel = 'noopener noreferrer';
+    tdN.appendChild(a);
+    if(it.src) tdN.appendChild(el('span','ptag', it.src));
+    tr.appendChild(tdN);
+
+    const cls = r => r>=1.05 ? 'good' : (r>=1.0 ? 'mid' : 'bad');
+    const tdR = el('td','ratio'); const sp = el('span', cls(it.ratio ?? 0),
+      fmt(it.ratio, 3)); tdR.appendChild(sp);
+    tr.appendChild(tdR);
+
+    const tdReal = el('td', (it.real ?? 0) >= 0 ? 'good' : 'bad',
+      (it.real===null?'—':((it.real>=0?'+':'') + fmt(it.real))));
+    tr.appendChild(tdReal);
+
+    tr.appendChild(el('td', null, '¥'+fmt(it.buy)));
+    tr.appendChild(el('td', null, '¥'+fmt(it.net)));
+    tr.appendChild(el('td','hide-s', it.bid ? '¥'+fmt(it.bid) : '—'));
+    tr.appendChild(el('td','hide-s', it.sell ? '¥'+fmt(it.sell) : '—'));
+    tr.appendChild(el('td', null, String(it.vol ?? '—')));
+    tr.appendChild(el('td','hide-s', it.src || '—'));
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+}
+
+// 表头排序
+document.querySelectorAll('th[data-k]').forEach(th => {
+  th.addEventListener('click', () => {
+    const k = th.dataset.k;
+    SORT = (SORT.k === k) ? {k, dir: -SORT.dir} : {k, dir: -1};
+    render();
+  });
+});
+['fRatio','fVol','fMin','fMax','fSrc','fDisc'].forEach(id =>
+  $(id).addEventListener('input', render));
+$('reset').addEventListener('click', () => {
+  $('fRatio').value = 1.00; $('fVol').value = 30;
+  $('fMin').value = 3; $('fMax').value = 20000;
+  $('fSrc').value = ''; $('fDisc').value = DISC_DEFAULT;
+  SORT = {k:'ratio', dir:-1}; render();
+});
+
+load();
+</script>
+</body>
+</html>

@@ -1,0 +1,4 @@
+{
+  "usd_cny": 7.10,
+  "note": "USD→CNY 汇率。Waxpeer 用美元报价，换元靠这个。改这里或设环境变量 USD_CNY。"
+}

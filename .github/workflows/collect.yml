@@ -1,0 +1,105 @@
+name: collect
+
+# Steam 社区市场在国内不可达，所以采集必须跑在境外出口上。
+# GitHub Actions 的 runner 由 Azure 托管，可以直接访问 steamcommunity.com。
+#
+# 注意：
+#   * cron 最短 5 分钟，但实际会延迟 5~15 分钟，别指望准点
+#   * 私有仓库免费额度 2000 分钟/月，这种跑法会超额 → 仓库设成 public
+#   * 数据存在 data 分支，每轮 fetch 下来、跑完 push 回去（depth=1，不会越拖越大）
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:        # 允许手动点一次，方便第一次验证
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+env:
+  DATA_DIR: /tmp/arbdata
+  REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: 取主分支代码
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 准备 data 分支
+        run: |
+          set -e
+          rm -rf "$DATA_DIR"
+          mkdir -p "$DATA_DIR"
+          cd "$DATA_DIR"
+          git init -q
+          git config user.name  "arb-bot"
+          git config user.email "arb-bot@users.noreply.github.com"
+          git remote add origin "$REPO_URL"
+          if git fetch -q --depth=1 origin data 2>/dev/null; then
+            git checkout -q -B data FETCH_HEAD
+            echo "已取到 data 分支"
+          else
+            git checkout -q --orphan data
+            echo "data 分支不存在，本轮新建"
+          fi
+          mkdir -p data
+
+      - name: 采集
+        env:
+          ARB_DB: /tmp/arbdata/data/arb.db
+          ARB_DATA: /tmp/arbdata/data
+          USD_CNY: ${{ vars.USD_CNY }}
+        run: |
+          set +e
+          cd collector
+          python run.py --batch 250 --pages 200 --nameid-budget 60
+          rc=$?
+          echo "collector exit=$rc"
+          # 采集失败也继续：可能已经有部分数据入库，导出旧数据比什么都没有好
+          ls -la "$ARB_DATA"
+          exit 0
+
+      - name: 回写 data 分支
+        run: |
+          set -e
+          cd "$DATA_DIR"
+          git add -A data
+          if git diff --cached --quiet; then
+            echo "没有变化，跳过 push"
+          else
+            git commit -q -m "data: $(date -u +%Y-%m-%dT%H:%MZ)"
+            git push -q origin data
+            echo "已推送"
+          fi
+
+      - name: 汇总
+        run: |
+          {
+            echo "### 采集完成"
+            python - <<'PY'
+          import json, os, time
+          fp = "/tmp/arbdata/data/latest.json"
+          if not os.path.exists(fp):
+              print("没有产出 latest.json")
+              raise SystemExit
+          d = json.load(open(fp, encoding="utf-8"))
+          print(f"- 物品 {d['count']} 件")
+          print(f"- 生成时间 {time.strftime('%Y-%m-%d %H:%M', time.localtime(d['generated']))}")
+          top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
+          print("\n| 面值比 | 物品 | 买入 | 净得 | 24h 成交 |")
+          print("| --- | --- | --- | --- | --- |")
+          for it in top:
+              print(f"| {it['ratio']:.3f} | {it['n']} | ¥{it['buy']:.2f} | ¥{it['net']:.2f} | {it['vol']} |")
+          PY
+          } >> $GITHUB_STEP_SUMMARY
