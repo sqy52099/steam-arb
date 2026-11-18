@@ -38,6 +38,12 @@ APPID = 730
 # 所以宁可少采一点也要自己先收工，把已经拿到的写回去。
 _DEADLINE = None
 
+# 本轮各环节的成败计数，跟着 latest.json 一起导出。
+# 用途：CI 上「采集失败也 exit 0」是为了保住旧数据，但那样从外面看不出
+# 是「Steam 连不上」还是「今天本来就没变化」。有了 health，汇总步骤就能
+# 直接判断并标红，不用人去翻日志。
+_HEALTH = {}
+
 
 def set_deadline(minutes: float) -> None:
     global _DEADLINE
@@ -50,6 +56,11 @@ def out_of_time() -> bool:
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def mark(key: str, ok: bool, detail: str = "") -> None:
+    """记一个环节的成败，最后进 latest.json 的 health 字段。"""
+    _HEALTH[key] = {"ok": bool(ok), "detail": str(detail)[:200]}
 
 
 def usd_cny() -> float:
@@ -137,6 +148,11 @@ def run_fake(args) -> None:
     upsert_items(con, [{"hash_name": r["hash_name"], "volume": r["volume"],
                         "nameid": 1000 + i} for i, r in enumerate(rows)])
     meta_set(con, "fake", 1)
+    # 假数据也要填 health，否则测汇总步骤时永远是空的，测不出标红逻辑。
+    mark("thirdparty", True, "fake")
+    mark("steam_list", True, "fake")
+    mark("nameid", True, "fake")
+    mark("steam_orders", True, "fake")
     log(f"[fake] 写入 {len(rows)} 条合成报价")
     export(args, con)
 
@@ -159,9 +175,11 @@ def run_real(args) -> None:
     except Exception as e:
         log(f"Skinport 失败：{e}")
     if not wax and not skin:
+        mark("thirdparty", False, "Skinport 和 Waxpeer 都失败")
         raise SystemExit("两家第三方都拿不到数据，本轮放弃（保留旧数据）")
     buy_map = thirdparty.merge(wax, skin)
     buy_by_name = {r["name"]: r for r in buy_map}
+    mark("thirdparty", True, f"waxpeer {len(wax)} / skinport {len(skin)} / 合并 {len(buy_by_name)}")
     log(f"合并后 {len(buy_by_name)} 条有买入价")
 
     # 2. 物品字典（Steam 列表接口）
@@ -173,8 +191,13 @@ def run_real(args) -> None:
         upsert_items(con, [{"hash_name": r["hash_name"],
                             "volume": r["sell_listings"],
                             "tradable": 1} for r in listed])
+        if listed:
+            mark("steam_list", True, f"{len(listed)} 件")
+        else:
+            mark("steam_list", False, "一件都没拿到（被拦或全空）")
         log(f"物品字典更新 {len(listed)} 条")
     except Exception as e:
+        mark("steam_list", False, str(e))
         log(f"Steam 列表接口不可用（{e}），跳过字典更新")
         listed = []
 
@@ -196,12 +219,16 @@ def run_real(args) -> None:
                 set_nameid(con, hn, nid, APPID)
                 ok += 1
         log(f"  补到 {ok}/{len(todo)}")
+        mark("nameid", ok > 0, f"{ok}/{len(todo)}")
+    else:
+        mark("nameid", True, "本轮不需要补")
 
     # 3b. 从已有 nameid 的池子里轮转取一批查求购价
     batch = pick_batch(con, args.pool, args.batch)
     log(f"本轮采集 {len(batch)} 件")
     got = 0
     scanned = 0        # 真正发过请求的件数，游标按它推进
+    err = ""
     for it in batch:
         if out_of_time():
             log("  时间预算用完，求购价采到一半停下")
@@ -214,6 +241,7 @@ def run_real(args) -> None:
             hist = st.orders_histogram(nameid)
         except Exception as e:
             log(f"  求购价失败 {hn}: {e}")
+            err = f"{hn}: {e}"
             break          # 多半是被限流了，本轮收工
         scanned += 1
         if not hist:
@@ -235,6 +263,10 @@ def run_real(args) -> None:
                      if (buy_cny and (net_bid or net)) else None,
         }])
     log(f"成功写入 {got} 条（实际请求 {scanned} 件）")
+    # 判断标准：只要真的发出去过请求并且有回音，就算这条链路通。
+    # 一件都没成交（got=0）可能只是这批恰好没数据，不等于被拦。
+    mark("steam_orders", scanned > 0,
+         f"{got}/{scanned}" + (f" · 中断于 {err}" if err else ""))
     advance_cursor(con, args.pool, scanned)
 
     # 4. 维护 + 导出
@@ -256,6 +288,9 @@ def export(args, con) -> None:
         "currency": "CNY",
         "count": len(rows),
         "note": "ratio = Steam 扣费后净得 ÷ 第三方买入价。余额折现要再乘 0.75~0.85。",
+        # 每轮各环节的成败。CI 采集失败也 exit 0（为了保住旧数据），
+        # 所以「这一轮到底通不通」只能靠它判断，汇总步骤读这个字段标红绿。
+        "health": _HEALTH,
         "items": [{
             "n": r["hash_name"],
             "sell": r["sell_cny"],

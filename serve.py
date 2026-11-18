@@ -4,7 +4,7 @@
 本地预览服务器：把 web/ 当站点根，把 data/ 挂到 /data/ 下。
 
 用法：python serve.py  然后打开 http://127.0.0.1:8770
-只用于本机看效果，不要拿去部署 —— 公开站点走 Cloudflare Pages。
+只用于本机看效果，不要拿去部署 —— 公开站点走 GitHub Pages。
 """
 import json
 import os

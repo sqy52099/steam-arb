@@ -3,10 +3,10 @@
 """
 把 web/ 和 data/latest.json 拼成一个可以直接发布的目录 _site/。
 
-Cloudflare Pages 的构建命令就写：
+CI 里由 collect.yml 调它（ARB_DATA 指向 /tmp/arbdata/data），
+产物交给 actions/upload-pages-artifact 发到 GitHub Pages。
+本地想手动构建就直接：
     python build_site.py
-构建输出目录写：
-    _site
 
 产物：
   _site/index.html

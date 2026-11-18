@@ -224,12 +224,47 @@ def t_schedule():
     con.close()
 
 
+def t_health():
+    """health 字段：CI 靠它区分「连不上 Steam」和「本来没变化」，缺了就等于没体检。"""
+    print("\\n体检字段")
+    import json
+    import run
+    import argparse
+
+    tmp = tempfile.mkdtemp(prefix="arbhealth_")
+    old_data = run.DATA
+    run.DATA = tmp
+    try:
+        args = argparse.Namespace(db=os.path.join(tmp, "h.db"), batch=5, pool=100,
+                                  pages=1, nameid_budget=0, export_limit=50,
+                                  within_hours=48, deadline=0, fake=True)
+        run.run_fake(args)
+        fp = os.path.join(tmp, "latest.json")
+        check("假数据跑完能导出 latest.json", os.path.isfile(fp))
+        with open(fp, encoding="utf-8") as f:
+            d = json.load(f)
+        h = d.get("health")
+        check("导出里带 health", isinstance(h, dict), str(type(h)))
+        keys = ("thirdparty", "steam_list", "nameid", "steam_orders")
+        missing = [k for k in keys if k not in h]
+        check("health 四个环节齐全", not missing, f"缺 {missing}")
+        bad = [k for k in keys if not (isinstance(h.get(k), dict)
+                                       and isinstance(h[k].get("ok"), bool)
+                                       and isinstance(h[k].get("detail"), str))]
+        check("每项都是 {ok: bool, detail: str}", not bad, f"不合格 {bad}")
+        check("detail 有长度上限，不会把整段日志塞进 JSON",
+              all(len(h[k]["detail"]) <= 200 for k in keys if k in h))
+    finally:
+        run.DATA = old_data
+
+
 def main():
     t_fees()
     t_steam_parse()
     t_store()
     t_merge()
     t_schedule()
+    t_health()
     print("\n" + "=" * 46)
     print(f"通过 {len(OK)} 项，失败 {len(FAIL)} 项")
     if FAIL:

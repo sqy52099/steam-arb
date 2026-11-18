@@ -47,6 +47,7 @@ td.name a:hover{color:var(--acc)}
 .legend b{color:var(--txt)}
 .warnbar{margin:0 0 14px;padding:10px 14px;border-radius:8px;
   background:#2a2118;border:1px solid #4a3a1a;color:#e8c98a;font-size:12.5px}
+.warnbar.stale{background:#2e1a1a;border-color:#5c2a2a;color:#f0a0a0}
 @media(max-width:760px){
   .wrap{padding:10px 10px 40px}
   th,td{padding:7px 6px;font-size:12.5px}
@@ -113,6 +114,14 @@ const DISC_DEFAULT = 0.80;
 let RAW = [], SORT = {k:'ratio', dir:-1};
 
 const $ = id => document.getElementById(id);
+
+function fmtAge(min){
+  if (min < 1) return '刚刚';
+  if (min < 60) return min + ' 分钟';
+  const h = Math.floor(min / 60);
+  if (h < 24) return h + ' 小时';
+  return Math.floor(h / 24) + ' 天';
+}
 const fmt = (v, d=2) => (v===null||v===undefined||!isFinite(v)) ? '—' : v.toFixed(d);
 const el = (t,c,txt) => { const e=document.createElement(t); if(c)e.className=c;
   if(txt!==undefined)e.textContent=txt; return e; };
@@ -130,10 +139,18 @@ async function load(){
     if(!r.ok) throw new Error('HTTP '+r.status);
     const j = await r.json();
     RAW = j.items || [];
+    const ageMin = Math.round((Date.now()/1000 - j.generated) / 60);
     $('stamp').textContent = '数据时间 ' +
-      new Date(j.generated*1000).toLocaleString('zh-CN',{hour12:false});
+      new Date(j.generated*1000).toLocaleString('zh-CN',{hour12:false}) +
+      '（' + fmtAge(ageMin) + '前）';
     $('cnt').textContent = `${RAW.length} 件`;
-    $('disc').textContent = j.note || '';
+    // 采集每 30 分钟一轮，加上排队延迟，正常不会超过 1 小时。
+    // 太久没更新基本等于 pipeline 停了，必须让人一眼看出来，别拿旧价当现价。
+    const stale = ageMin > 90
+      ? `⚠ 数据已经 ${fmtAge(ageMin)}没更新了，下面的价格很可能已失效，别照着下单。`
+      : '';
+    $('disc').textContent = (stale ? stale + ' ' : '') + (j.note || '');
+    if (stale) $('disc').classList.add('stale');
   }catch(e){
     $('stamp').textContent = '数据加载失败：' + e.message;
     $('disc').textContent = '找不到 data/latest.json。本地预览先跑：'

@@ -10,7 +10,7 @@ Steam 社区市场（`steamcommunity.com`）在国内直连不通。所以：
 ```
 GitHub Actions（境外出口，免费）  →  采集入库
         ↓ 写 data 分支
-Cloudflare Pages（静态站）        →  只读展示
+GitHub Pages（静态站）            →  只读展示
 ```
 
 本机只管开发和预览，不需要能连 Steam。
@@ -86,10 +86,48 @@ pub_fee   = max(1, floor(net × 10%))
 
 1. 仓库设成 **public**（私有仓库 Actions 2000 分钟/月会超）
 2. 推上去，`.github/workflows/collect.yml` 每 30 分钟跑一次（实际延迟 5~15 分钟）
-3. Cloudflare Pages 连这个仓库：
-   - 构建命令 `python build_site.py`
-   - 输出目录 `_site`
+3. 仓库 **Settings → Pages → Source 选 "GitHub Actions"**（只需设一次）。
+   之后每次采集跑完，同一次 workflow 里的 `deploy` job 会自动把 `_site/` 发上去，
+   不用另建 workflow，也不会出现页面比数据新/旧的问题。
 4. 汇率可在仓库 Variables 里设 `USD_CNY`，或放 `data/rate.json`
+
+站点地址是 `https://<用户名>.github.io/steam-arb/`。
+前端所有请求都是相对路径，放项目页子路径下能直接用。
+
+### 本机推代码：走 SSH over 443
+
+本机 `github.com:443` 是不通的（解析到的那个 IP 被墙），但 `ssh.github.com:443`
+通 —— 所以推代码走 SSH，别用 HTTPS：
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519_github -N "" -C "github"
+# 公钥贴到 GitHub → Settings → SSH and GPG keys
+
+cat >> ~/.ssh/config <<'EOF'
+Host github.com
+  HostName ssh.github.com
+  Port 443
+  User git
+  IdentityFile ~/.ssh/id_ed25519_github
+EOF
+
+ssh -T git@github.com     # 出现 "Hi <用户名>!" 就通了
+git remote add origin git@github.com:<用户名>/steam-arb.git
+git push -u origin main
+```
+
+### 第一次跑完看哪里
+
+Actions → collect → 最新一次 → 下面的 Summary。
+里面有一张「环节 / 状态 / 详情」表：
+
+- 四个环节全 ✅ = 一切正常
+- `Steam 物品列表` 或 `Steam 求购价` ❌ = runner 出口被 Steam 拦了（这是最可能
+  踩的坑，第一次手动触发就要确认这件事），此时页面上的数字是上一轮的
+- 只是数字没变、表全 ✅ = 真的没变化，不是故障
+
+采集那步失败也 `exit 0`（为了保住旧数据），所以**不要看 job 是绿是红**，
+要看 Summary 里那张表。
 
 ### 时间预算（改参数前必看）
 

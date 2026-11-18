@@ -17,6 +17,9 @@ on:
 
 permissions:
   contents: write
+  # 前端是纯静态页，直接由本 job 发布到 Pages（不用再单独开一个 workflow）
+  pages: write
+  id-token: write
 
 concurrency:
   group: collect
@@ -92,25 +95,89 @@ jobs:
       - name: 汇总
         run: |
           {
-            echo "### 采集完成"
+            echo "### 采集结果"
             python - <<'PY'
           import json, os, time
           fp = os.path.join(os.environ.get("DATA_DIR", "/tmp/arbdata"),
                             "data", "latest.json")
           if not os.path.exists(fp):
-              print("没有产出 latest.json —— 本轮采集可能整体失败")
+              print("")
+              print("**❌ 没有产出 latest.json —— 本轮整体失败**")
+              print("::error::本轮没有产出 latest.json")
               raise SystemExit
           d = json.load(open(fp, encoding="utf-8"))
-          age = (time.time() - d["generated"]) / 60
-          print(f"- 物品 {d['count']} 件")
-          print(f"- 生成于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(d['generated']))}"
-                f"（{age:.0f} 分钟前）")
-          top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
+
+          # 采集失败也 exit 0（为了保住旧数据），所以「这一轮通不通」
+          # 只能看 health，不能看 job 是绿是红。
+          h = d.get("health") or {}
+          parts = [("thirdparty", "第三方买入价"),
+                   ("steam_list", "Steam 物品列表"),
+                   ("nameid", "补 nameid"),
+                   ("steam_orders", "Steam 求购价")]
+          dead = []
           print("")
-          print("| 面值比 | 物品 | 买入 | 净得 | 24h 成交 |")
-          print("| --- | --- | --- | --- | --- |")
-          for it in top:
-              print(f"| {it['ratio']:.3f} | {it['n']} | ¥{it['buy']:.2f} "
-                    f"| ¥{it['net']:.2f} | {it['vol']} |")
+          print("| 环节 | 状态 | 详情 |")
+          print("| --- | --- | --- |")
+          for k, label in parts:
+              v = h.get(k)
+              if not v:
+                  print("| %s | ❔ 未记录 | 这一轮没走到 |" % label)
+                  continue
+              ok = bool(v.get("ok"))
+              if not ok and k in ("steam_list", "steam_orders"):
+                  dead.append(label)
+              detail = (v.get("detail") or "").replace("|", "\\|")
+              print("| %s | %s | %s |" % (label, "✅" if ok else "❌", detail))
+
+          age = (time.time() - d["generated"]) / 60
+          print("")
+          print("- 手上 %d 件，数据生成于 %s（%.0f 分钟前）"
+                % (d["count"],
+                   time.strftime("%Y-%m-%d %H:%M", time.localtime(d["generated"])),
+                   age))
+          if dead:
+              sep = "、"
+              msg = "%s 失败 —— 多半是 runner 出口被 Steam 拦了，本轮页面数字不变" \
+                    % sep.join(dead)
+              print("")
+              print("**❌ %s**" % msg)
+              print("::error::%s" % msg)
+          top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
+          if top:
+              print("")
+              print("| 面值比 | 物品 | 买入 | 净得 | 24h 成交 |")
+              print("| --- | --- | --- | --- | --- |")
+              for it in top:
+                  # 物品名里几乎都带 " | "（AK-47 | Redline），不转义会把表格列撑破
+                  name = (it.get("n") or "").replace("|", "\\|")
+                  print("| %.3f | %s | ¥%.2f | ¥%.2f | %s |"
+                        % (it.get("ratio") or 0, name, it.get("buy") or 0,
+                           it.get("net") or 0, it.get("vol") or 0))
           PY
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # 采集完顺手把静态页发到 Pages。这样只用一个 workflow：
+      # 数据更新和页面更新永远同步，不会出现页面比数据新/旧的问题。
+      - name: 构建静态页
+        env:
+          ARB_DATA: /tmp/arbdata/data
+        run: python build_site.py
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: run
+    runs-on: ubuntu-latest
+    # 采集那步哪怕标红，只要这份数据还写得出来，页面也该继续用旧的数字，
+    # 所以只在 job 被取消时跳过，失败也照样部署。
+    if: ${{ !cancelled() }}
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
