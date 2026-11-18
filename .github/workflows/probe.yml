@@ -1,9 +1,7 @@
 name: probe
 
-# round 6：搞清两件事
-#  (a) 新版 SSR 页里的 orderbook / strItemName 能不能拿到真实求购价
-#  (b) priceoverview 的真实吞吐（1.0s 间隔）
-# 用完即删。
+# round 7：把物品页内嵌的 orderbook（TanStack Query 脱水状态）结构挖出来，
+# 顺便测 priceoverview 的 429 多久恢复。用完即删。
 on:
   workflow_dispatch:
   push:
@@ -47,8 +45,6 @@ jobs:
               "Accept-Encoding": "gzip, deflate",
               "Referer": BASE + "/market/",
           }
-          NAME = "Prisma Case"
-          QN = urllib.parse.quote(NAME)
 
           jar = http.cookiejar.CookieJar()
           OP = urllib.request.build_opener(
@@ -70,15 +66,6 @@ jobs:
                   return None, str(e).encode(), time.time() - t0
 
 
-          def uz(raw):
-              if raw[:2] == b"\x1f\x8b":
-                  try:
-                      return gzip.decompress(raw).decode("utf-8", "replace")
-                  except Exception:
-                      pass
-              return raw.decode("utf-8", "replace")
-
-
           print("=== 出口 IP ===")
           try:
               with urllib.request.urlopen("https://api.ipify.org", timeout=15) as r:
@@ -87,97 +74,50 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          st, raw, _ = fetch(BASE + "/market/listings/730/" + QN, HTML_HDR)
+          NAME = "Prisma Case"
+          st, raw, dt = fetch(
+              BASE + "/market/listings/730/" + urllib.parse.quote(NAME), HTML_HDR)
           text = raw.decode("utf-8", "replace")
-          print("物品页 HTTP %s %dB" % (st, len(raw)))
+          print("物品页 HTTP %s %dB %.1fs" % (st, len(raw), dt))
           print("")
 
-          print("=== orderbook 上下文 ===")
-          for m in re.finditer(r"orderbook", text):
-              ctx = text[max(0, m.start() - 250):m.end() + 250]
-              print("  %s" % ctx.replace("\n", " ")[:500])
-              print("  ---")
+          # 定位 orderbook 那段 dehydrated state，把它周围的 JSON 抠出来
+          idx = text.find('"market","orderbook"')
+          print("orderbook 标记位置: %d / %d" % (idx, len(text)))
+          if idx < 0:
+              print("没找到，收工")
+              raise SystemExit
+
+          # 向前找 state 起点，向后找结束
+          seg = text[max(0, idx - 3000):idx + 12000]
+          # 反转义：这是嵌在 JSON 字符串里的，有 \" 转义
+          un = seg.replace('\\"', '"').replace("\\\\", "\\")
+          print("")
+          print("=== 反转义后 orderbook 附近 3000 字符 ===")
+          print(un[:3000])
+          print("")
+          print("=== 其中 data 之后的 2500 字符 ===")
+          di = un.find('"data"')
+          print(un[di:di + 2500] if di >= 0 else "(没找到 data)")
           print("")
 
-          # 找所有 API 路径线索
-          print("=== 页面里出现的 /market/ 路径 ===")
-          paths = set(re.findall(r"/market/[a-z/_]+", text))
-          for p in sorted(paths):
-              print("  %s" % p)
+          # 直接找所有 queryKey，看看页面一共预取了多少接口
+          print("=== 页面预取的所有 queryKey ===")
+          keys = re.findall(r'\\?"queryKey\\?"\s*:\s*(\[[^\]]{0,120}\])', text)
+          for k in keys[:20]:
+              print("  %s" % k.replace('\\"', '"'))
           print("")
 
-          # 提取 strItemName
-          m = re.search(r'"strItemName"\s*:\s*"([A-Za-z0-9]+)"', text)
-          strname = m.group(1) if m else None
-          print("strItemName = %s" % strname)
-          print("")
-
-          print("=== 带 strItemName / classid 试接口 ===")
-          if strname:
-              tries = [
-                  ("histogram by strItemName",
-                   BASE + "/market/itemordershistogram/?" + urllib.parse.urlencode(
-                       {"norender": 1, "country": "CN", "language": "zh",
-                        "currency": 23, "item_nameid": strname})),
-                  ("orderbook json",
-                   BASE + f"/market/listings/730/{QN}/orderbook"),
-                  ("listings render (已有数据?)",
-                   BASE + f"/market/listings/730/{QN}/render/?" +
-                   urllib.parse.urlencode({"query": "", "start": 0, "count": 10,
-                                           "country": "CN", "language": "zh",
-                                           "currency": 23})),
-              ]
-              for label, u in tries:
-                  st2, raw2, dt = fetch(u, HDR)
-                  body = uz(raw2)
-                  print("  %-26s HTTP %-4s %5.1fs %r" %
-                        (label, st2, dt, body[:200]))
-                  time.sleep(2)
-          print("")
-
-          # price_median/purchases 能不能解析成销量序列
-          print("=== 页面内嵌销量序列（前 2 条） ===")
-          ms = list(re.finditer(
-              r'\{"time":(\d+),[^}]*"purchases":(\d+)\}', text))
-          print("  匹配 %d 条" % len(ms))
-          for mm in ms[:2]:
-              print("    time=%s purchases=%s" % (mm.group(1), mm.group(2)))
-          print("")
-
-          # priceoverview 吞吐：1.0 秒间隔打 30 次
-          print("=== priceoverview 30 次（间隔 1.0s） ===")
-          items = ["Prisma Case", "Fracture Case", "Recoil Case",
-                   "Revolution Case", "Danger Zone Case", "Snakebite Case",
-                   "Kilowatt Case", "Gallery Case", "Dreams & Nightmares Case",
-                   "Operation Broken Fang Case"]
-          ok = 0
-          for i in range(30):
-              nm = items[i % len(items)]
+          # priceoverview 429 恢复测试
+          print("=== priceoverview 429 后恢复测试 ===")
+          for wait in (0, 30, 60):
+              if wait:
+                  print("  等 %d 秒..." % wait)
+                  time.sleep(wait)
               q = urllib.parse.urlencode({"appid": 730, "currency": 23,
-                                          "market_hash_name": nm})
-              st3, raw3, dt = fetch(BASE + "/market/priceoverview/?" + q, HDR)
-              if st3 == 200:
-                  ok += 1
-              else:
-                  print("  #%02d HTTP %s" % (i, st3))
-              time.sleep(1.0)
-          print("  → 成功 %d/30（间隔 1.0s）" % ok)
-          print("")
-
-          # 物品页吞吐：间隔 1.0s 打 8 次
-          print("=== 物品页 8 次（间隔 1.0s） ===")
-          ok2 = 0
-          for i in range(8):
-              nm = items[i % len(items)]
-              st4, raw4, dt = fetch(
-                  BASE + "/market/listings/730/" + urllib.parse.quote(nm),
-                  HTML_HDR)
-              if st4 == 200:
-                  ok2 += 1
-              else:
-                  print("  #%02d HTTP %s" % (i, st4))
-              time.sleep(1.0)
-          print("  → 成功 %d/8" % ok2)
+                                          "market_hash_name": NAME})
+              s2, r2, d2 = fetch(BASE + "/market/priceoverview/?" + q, HDR)
+              print("  等%2ds 后 → HTTP %s %r" % (wait, s2, r2[:80]))
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -192,5 +132,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r6: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r7: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
