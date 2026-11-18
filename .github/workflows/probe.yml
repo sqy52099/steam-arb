@@ -107,11 +107,11 @@ jobs:
         run: |
           set -e
           cd "$OUT_DIR"
+          ls -la
           git init -q
           git config user.name probe
           git config user.email probe@local
           git checkout -q -b probe-log
-          cp probe.json .
           git add -A
           git commit -q -m "probe $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
