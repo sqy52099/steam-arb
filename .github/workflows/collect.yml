@@ -80,7 +80,8 @@ jobs:
           # merge 只有一个 IP，撞上限流就整轮退回汇率、价格全偏高 6%。
           python run.py --mode collect \
             --shard "$SHARD_ID" --shards "$SHARDS" \
-            --batch 120 --deadline 12 --fx-samples 4 --out-dir "$OUT_DIR"
+            --batch 120 --deadline 12 --fx-samples 4 --net-give-up 5 \
+            --out-dir "$OUT_DIR"
           echo "采集 exit=$?"
           # 采不到也要写出空 shard：merge 靠它的 health 判断这一路是被拦还是没数据
           ls -la "$OUT_DIR" || true

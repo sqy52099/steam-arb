@@ -165,6 +165,7 @@ def run_collect(args) -> None:
     tried = 0        # 真发过请求的件数
     ok = 0
     throttled = 0
+    netfail = 0
     last_err = ""
     for hn in picked:
         if out_of_time():
@@ -172,6 +173,17 @@ def run_collect(args) -> None:
             break
         try:
             ob = st.item_orderbook(hn, APPID)
+        except st.NetworkFailed as e:
+            tried += 1
+            netfail += 1
+            last_err = f"{hn}: {e}"
+            # 连不上和限流不是一回事：429 睡一会还能等到恢复窗口，
+            # 连不上就只是这台机器到不了 Steam。线上出现过四个 shard
+            # 全部 0 成功、artifacts 只有 386 字节 —— 全是这样烧掉的。
+            if netfail >= args.net_give_up:
+                log(f"  连续 {netfail} 次连不上 Steam，收工")
+                break
+            continue
         except st.RateLimited as e:
             tried += 1
             throttled += 1
@@ -192,6 +204,7 @@ def run_collect(args) -> None:
             continue
         tried += 1
         throttled = 0
+        netfail = 0
         c = cand[hn]
         items.append({
             "n": hn,
@@ -210,7 +223,10 @@ def run_collect(args) -> None:
             log(f"  已采 {ok}/{len(picked)}")
 
     detail = f"{ok}/{tried} 成功" + (f" · {last_err}" if last_err else "")
-    mark("steam_orders", tried > 0, detail)
+    # 「连不上」不算通。发出去过请求不等于拿到回音 —— 线上第五轮四个
+    # shard 全 0 成功，但 tried 是正数，标成「通」会让人以为接口没问题。
+    reachable = tried - netfail
+    mark("steam_orders", ok > 0 or reachable > 0, detail)
     log(f"shard{args.shard} 完成：{detail}")
 
     # 顺手标定一份折算比。merge 是单独一个 job、只有一个出口 IP，撞上
@@ -612,6 +628,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=140, help="每个 shard 采几件")
     ap.add_argument("--give-up", type=int, default=25,
                     help="连续被限流多少次就放弃本 shard")
+    ap.add_argument("--net-give-up", type=int, default=5,
+                    help="连续多少次连不上 Steam 就放弃本 shard（和限流分开，"
+                         "连不上等再久也没用，只会把整轮预算烧光）")
     ap.add_argument("--out-dir", default="")
     ap.add_argument("--in-dir", default="")
     ap.add_argument("--fx-samples", type=int, default=6,

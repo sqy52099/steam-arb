@@ -61,6 +61,15 @@ class RateLimited(RuntimeError):
     """长时间被限流（保留给调用方判断，正常流程不会抛）。"""
 
 
+class NetworkFailed(RuntimeError):
+    """连不上（DNS / TCP / TLS / 超时）。
+
+    和 RateLimited 分开：429 等一等还有救，连不上就是这台机器现在到不了
+    Steam，多试几十次只是把整轮预算耗光。线上出现过四个 shard 全部 0
+    成功、artifacts 只有 386 字节，就是这么烧掉的。
+    """
+
+
 class Challenge(RuntimeError):
     """Steam 回了 HTML 拦截页而不是要的内容。"""
 
@@ -113,6 +122,13 @@ def _env_float(key: str, default: float) -> float:
 
 LIMITER = Limiter()
 
+# 单个请求的连接/读取上限。原来写 45~50 秒，一台机器整片连不上 Steam 时
+# 每件要白等 50 秒 × retries，12 分钟预算只够试十来件就收工 —— 线上出现过
+# 四个 shard 全部 0 成功、artifacts 只有 386 字节的情况。物品页正常 1~3 秒
+# 就回来，15 秒还拿不到基本就是挂了。
+FETCH_TIMEOUT = _env_float("STEAM_TIMEOUT", 15.0)
+
+
 HTML_HEADERS = {
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -158,9 +174,13 @@ def _fetch(url: str, headers: dict, timeout: int = 45,
                 continue
             # 404 之类是真实结果，交给调用方判断
             return e.code, e.read()[:400]
-        except Exception as e:          # 网络抖动
+        except Exception as e:          # 网络抖动 / 超时
             last = e
-            time.sleep(3 + i * 3)
+            # 连着失败说明这台机器现在根本连不上，多睡没意义；第一次
+            # 抖动给一次重试机会，之后就快速把 (0, 原因) 交出去，让上层
+            # 按 RateLimited 计数收工，别把 12 分钟耗在等超时上。
+            if i == 0 and retries > 0:
+                time.sleep(2)
     return 0, str(last or "请求失败").encode()
 
 
@@ -395,8 +415,10 @@ def item_orderbook(hash_name: str, appid: int = APPID) -> dict:
     """抓一个物品页并解析盘口。失败抛异常，由调用方决定记不记。"""
     url = (f"{BASE}/market/listings/{appid}/"
            f"{urllib.parse.quote(hash_name, safe='')}")
-    st, raw = _fetch(url, HTML_HEADERS, timeout=50, retries=1)
-    if st == 429 or st == 0:
+    st, raw = _fetch(url, HTML_HEADERS, timeout=FETCH_TIMEOUT, retries=1)
+    if st == 0:
+        raise NetworkFailed(f"连不上：{raw[:100].decode('utf-8', 'replace')}")
+    if st == 429:
         raise RateLimited(f"物品页 HTTP {st}")
     if st == 404:
         raise ParseError("物品不存在（404）")

@@ -387,7 +387,7 @@ def t_fake():
     try:
         args = argparse.Namespace(
             mode="fake", db=os.path.join(tmp, "f.db"),
-            shard=0, shards=3, batch=6, give_up=25,
+            shard=0, shards=3, batch=6, give_up=25, net_give_up=5,
             out_dir=os.path.join(tmp, "shards"),
             in_dir=os.path.join(tmp, "shards"), fx_samples=0,
             export_limit=50, within_hours=48, deadline=0)
@@ -474,7 +474,7 @@ def t_merge_real():
     try:
         args = argparse.Namespace(
             mode="merge", db=os.path.join(tmp, "m.db"), shard=0, shards=2,
-            batch=2, give_up=25, out_dir=shards, in_dir=shards,
+            batch=2, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
             fx_samples=2, export_limit=50, within_hours=48, deadline=0)
         run.run_merge(args)                       # 这里崩，线上就全丢
 
@@ -564,7 +564,7 @@ def t_sanity():
     try:
         args = argparse.Namespace(
             mode="merge", db=os.path.join(tmp, "s.db"), shard=0, shards=1,
-            batch=3, give_up=25, out_dir=shards, in_dir=shards,
+            batch=3, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
             fx_samples=3, export_limit=50, within_hours=48, deadline=0)
         run.run_merge(args)
         fp = os.path.join(tmp, "latest.json")
@@ -651,7 +651,7 @@ def t_shard_fx():
     try:
         args = argparse.Namespace(
             mode="merge", db=os.path.join(tmp, "f.db"), shard=0, shards=4,
-            batch=1, give_up=25, out_dir=shards, in_dir=shards,
+            batch=1, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
             fx_samples=6, export_limit=50, within_hours=48, deadline=0)
         run.run_merge(args)
         d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
@@ -693,7 +693,7 @@ def t_fx_reuse():
               "ts": now}]
     args = argparse.Namespace(
         mode="merge", db=os.path.join(tmp, "f.db"), shard=0, shards=1,
-        batch=1, give_up=25, out_dir=shards, in_dir=shards,
+        batch=1, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
         fx_samples=0, export_limit=50, within_hours=48, deadline=0)
 
     def one_shard(fx):
@@ -762,6 +762,51 @@ def t_fx_reuse():
         run.DATA = old_data
 
 
+def t_net_give_up():
+    """连不上 Steam 时要快速收工，不能把整轮预算耗在等超时上。
+
+    线上第五轮出现过四个 shard 全部 0 成功、artifacts 各 386 字节：
+    物品页请求全返 HTTP 0（连不上），而当时超时写的是 50 秒、每次还
+    retries=1，一件就要 100 秒，12 分钟预算只够试七件。
+    """
+    print("\n连不上时的止损")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbnet_")
+    calls = []
+
+    def boom(hn, appid=730):
+        calls.append(hn)
+        raise steam.NetworkFailed("连不上：timed out")
+
+    real = steam.item_orderbook
+    real_cand = run.fetch_candidates
+    steam.item_orderbook = boom
+    run.fetch_candidates = lambda p="": {
+        f"Item {i}": {"buy_cny": 10.0, "src": "waxpeer", "src_qty": 1,
+                      "steam_mid_cny": None} for i in range(40)}
+    try:
+        args = argparse.Namespace(
+            mode="collect", db="", shard=0, shards=1, batch=40,
+            give_up=25, net_give_up=5, out_dir=tmp, in_dir=tmp,
+            fx_samples=0, export_limit=50, within_hours=48, deadline=0)
+        run.run_collect(args)
+        check("连不上 5 次就收工，不再往下试",
+              len(calls) == 5, f"试了 {len(calls)} 次")
+        with open(os.path.join(tmp, "shard-00.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        check("连不上要算 Steam 环节失败",
+              d["health"]["steam_orders"]["ok"] is False,
+              str(d["health"].get("steam_orders")))
+        check("说清楚是连不上，不是被限流",
+              "连不上" in d["health"]["steam_orders"]["detail"],
+              d["health"]["steam_orders"]["detail"])
+    finally:
+        steam.item_orderbook = real
+        run.fetch_candidates = real_cand
+
+
 def main():
     t_fees()
     t_price()
@@ -773,6 +818,7 @@ def main():
     t_merge_real()
     t_sanity()
     t_shard_fx()
+    t_net_give_up()
     t_fx_reuse()
     t_shards()
     t_deadline()
