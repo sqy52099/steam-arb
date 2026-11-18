@@ -25,7 +25,9 @@ KEEP_DAYS = 7
 
 # 表结构改过一次：v1 是 (ts,...) 主键攒历史，v2 是 (appid,hash_name) 主键存快照。
 # 版本号写进 meta，对不上就整表重建（这库本来就是可再生的缓存）。
-SCHEMA_VERSION = "3"
+# v4 加了 hist：每件每天一行，给前端画涨跌用。quotes 仍然只留最新快照，
+# 因为它要一天更新几十次；hist 一天只写一次，所以攒得起。
+SCHEMA_VERSION = "4"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -67,6 +69,22 @@ CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
     v TEXT
 );
+
+-- 每天每件一行，给前端画涨跌。quotes 一天要更新几十次，攒历史会撑爆；
+-- 这张表一天只写一次（同一天重复写就覆盖），一年 6580 件也才 240 万行，
+-- 但实际只留 30 天，所以最多二十几万行，压完几百 KB。
+CREATE TABLE IF NOT EXISTS hist (
+    appid     INTEGER NOT NULL,
+    hash_name TEXT    NOT NULL,
+    day       INTEGER NOT NULL,   -- 当天 0 点的时间戳（UTC+8 切天）
+    net_cny   REAL,               -- 当天最后一轮的净得（按求购价卖）
+    sell_cny  REAL,
+    bid_cny   REAL,
+    src_buy   REAL,
+    ratio     REAL,
+    PRIMARY KEY (appid, hash_name, day)
+);
+CREATE INDEX IF NOT EXISTS idx_hist_day ON hist(appid, day);
 """
 
 
@@ -198,6 +216,82 @@ def purge_old(con, keep_days: int = KEEP_DAYS) -> int:
     """久没更新的物品清掉（下架了、或第三方不再收录）。"""
     cutoff = int(time.time()) - keep_days * 86400
     n = con.execute("DELETE FROM quotes WHERE ts < ?", (cutoff,)).rowcount
+    con.commit()
+    return n
+
+
+# ---------------- hist：按天的历史 ----------------
+
+HIST_DAYS = 30
+TZ_OFFSET = 8 * 3600   # 按北京时间切天，不然「今天」和人的直觉差 8 小时
+
+
+def day_key(ts: int | None = None) -> int:
+    """把一个时间戳归到它那天的 0 点（北京时间）。"""
+    t = int(ts if ts is not None else time.time())
+    return ((t + TZ_OFFSET) // 86400) * 86400 - TZ_OFFSET
+
+
+def upsert_hist(con, rows: list[dict], appid: int = 730,
+                ts: int | None = None) -> int:
+    """同一天重复跑就覆盖当天的值 —— 一天里最后一轮才算数。
+
+    不累加、不追加：一天采 48 轮，全存下来一年就是十几万行乘件数，
+    而画趋势一天一个点就够。想看小时级的得另开一张表，先不做。
+    """
+    d = day_key(ts)
+    n = 0
+    for r in rows:
+        hn = r.get("hash_name") or r.get("name") or r.get("n")
+        if not hn:
+            continue
+        if r.get("net_cny") is None:
+            continue
+        con.execute(
+            """INSERT INTO hist(appid,hash_name,day,net_cny,sell_cny,bid_cny,
+                                src_buy,ratio)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(appid,hash_name,day) DO UPDATE SET
+                 net_cny=excluded.net_cny, sell_cny=excluded.sell_cny,
+                 bid_cny=excluded.bid_cny, src_buy=excluded.src_buy,
+                 ratio=excluded.ratio""",
+            (appid, hn, d, r.get("net_cny"), r.get("sell_cny"),
+             r.get("bid_cny"), r.get("src_buy_cny"), r.get("ratio")))
+        n += 1
+    con.commit()
+    return n
+
+
+def hist_series(con, days: int = 30, appid: int = 730,
+                limit: int = 3000) -> dict:
+    """导出给前端：{物品名: [[day, net], ...]}，只带跟踪得够久的。
+
+    只取最近 N 天里出现过 ≥2 天的 —— 只有一天的数据画不出线，
+    带上去只是把 json 撑大。
+    """
+    since = day_key() - (days - 1) * 86400
+    cur = con.execute(
+        """SELECT hash_name, day, net_cny, ratio FROM hist
+           WHERE appid=? AND day>=? AND net_cny IS NOT NULL
+           ORDER BY hash_name, day""",
+        (appid, since))
+    out: dict[str, list] = {}
+    for r in cur.fetchall():
+        out.setdefault(r["hash_name"], []).append(
+            [r["day"], round(r["net_cny"], 2), round(r["ratio"], 4)
+             if r["ratio"] is not None else None])
+    # 一个点的不要
+    out = {k: v for k, v in out.items() if len(v) >= 2}
+    if len(out) > limit:
+        # 撑不下就按点数多的优先，这些才是被长期跟踪的
+        keep = sorted(out.items(), key=lambda kv: -len(kv[1]))[:limit]
+        out = dict(keep)
+    return out
+
+
+def purge_hist(con, keep_days: int = HIST_DAYS) -> int:
+    cutoff = day_key() - keep_days * 86400
+    n = con.execute("DELETE FROM hist WHERE day < ?", (cutoff,)).rowcount
     con.commit()
     return n
 

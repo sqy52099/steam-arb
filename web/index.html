@@ -83,7 +83,86 @@ tr.calcrow:hover td{background:var(--panel)}
 .calc input{width:78px}
 .calc b{font-variant-numeric:tabular-nums;font-weight:600}
 
+/* 顶部页签：比价表是「看行情」，另外三块是「看完要动手」的事 */
+.tabs{display:flex;gap:2px;padding:0 20px;border-bottom:1px solid var(--line);
+  background:#12151b;position:sticky;top:0;z-index:5;flex-wrap:wrap}
+.tab{background:none;border:none;border-bottom:2px solid transparent;color:var(--dim);
+  padding:11px 14px;font:inherit;font-size:13.5px;cursor:pointer}
+.tab:hover{color:var(--txt)}
+.tab.on{color:var(--acc);border-bottom-color:var(--acc)}
+.pane[hidden]{display:none}
+
+/* 折扣榜：先说人话（花多少拿多少），再给数字 */
+.rankbar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+.rankbar .tip{color:var(--dim);font-size:11.5px;padding-bottom:7px}
+.ck{display:flex;gap:5px;align-items:center;font-size:12.5px;color:var(--dim);
+  padding-bottom:7px;cursor:pointer;user-select:none}
+.ck input{width:auto}
+.cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(330px,1fr));gap:10px}
+.card{display:flex;gap:12px;align-items:center;padding:12px 14px;
+  background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.card:hover{border-color:#31405a}
+.card .rk{font-size:17px;font-weight:700;color:#3f4756;min-width:26px;text-align:center;
+  font-variant-numeric:tabular-nums}
+.card.top1 .rk{color:#f5c451} .card.top2 .rk{color:#c3ccd8} .card.top3 .rk{color:#d08a4e}
+.card .cbody{flex:1;min-width:0}
+.card .cname{font-weight:600;margin-bottom:3px;word-break:break-word;line-height:1.35}
+.card .cname .en{display:block;font-size:10.5px;color:var(--dim);font-weight:400;
+  word-break:break-all;line-height:1.25}
+.card .deal{font-size:13px;line-height:1.5}
+.card .deal b{font-variant-numeric:tabular-nums;font-weight:600}
+.card .off{display:inline-block;margin-left:7px;padding:1px 7px;border-radius:5px;
+  background:#1b3527;color:#6ee7a0;font-size:12px;font-weight:600;
+  font-variant-numeric:tabular-nums}
+.card .off.warn{background:#3a301d;color:#f5c451}
+.card .off.bad{background:#3a1d1d;color:#f0a0a0}
+.card .cmeta{font-size:11.5px;color:var(--dim);margin-top:4px;line-height:1.5}
+.card .add{flex:none;font-size:12px;padding:5px 9px}
+.sub{display:block;font-size:10.5px;color:var(--dim);margin-top:1px;
+  font-variant-numeric:tabular-nums}
+
+/* 我的库存 */
+.holdsum{display:flex;gap:26px;flex-wrap:wrap;padding:12px 16px;margin-bottom:14px;
+  background:var(--panel);border:1px solid var(--line);border-radius:8px}
+.holdsum div{font-size:11.5px;color:var(--dim)}
+.holdsum b{display:block;font-size:17px;color:var(--txt);font-weight:600;margin-top:3px;
+  font-variant-numeric:tabular-nums}
+.holdbar{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;margin-bottom:14px}
+.holdbar select{width:250px}
+.spark{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:10px 14px;margin-top:16px}
+.spark .hd{font-size:11.5px;color:var(--dim);margin-bottom:4px}
+.spark svg{display:block;width:100%;height:64px}
+
+/* 计算器 */
+.calcbox{display:grid;grid-template-columns:minmax(260px,320px) 1fr;gap:16px;
+  align-items:start}
+.calcform{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:14px 16px}
+.calcform .f{margin-bottom:14px}
+.calcform .f:last-child{margin-bottom:0}
+.calcform input,.calcform select{width:100%}
+.calcout{display:grid;grid-template-columns:repeat(auto-fill,minmax(140px,1fr));gap:10px}
+.calcout .cell{background:var(--panel);border:1px solid var(--line);border-radius:8px;
+  padding:11px 13px}
+.calcout .cell i{display:block;font-style:normal;font-size:11px;color:var(--dim)}
+.calcout .cell b{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.calcout .cell b.good{color:var(--up)} .calcout .cell b.bad{color:var(--down)}
+
+/* 记进库存后的一句话提示：别把人从当前页签拽走 */
+#toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,12px);
+  background:#22303f;border:1px solid #3a4a5e;color:var(--txt);padding:9px 16px;
+  border-radius:8px;font-size:13px;opacity:0;pointer-events:none;
+  transition:opacity .18s,transform .18s;z-index:20;max-width:88vw}
+#toast.on{opacity:1;transform:translate(-50%,0)}
+
 @media(max-width:760px){
+  .tabs{padding:0 10px}
+  .tab{padding:10px 10px;font-size:12.5px}
+  .calcbox{grid-template-columns:1fr}
+  .cards{grid-template-columns:1fr}
+  .holdbar select{width:100%}
+  .holdbar .f{flex:1 1 100%}
   .wrap{padding:10px 10px 40px}
   th,td{padding:7px 6px;font-size:12.5px}
   .hide-s{display:none}
@@ -101,7 +180,14 @@ tr.calcrow:hover td{background:var(--panel)}
   <span class="meta" id="cnt"></span>
 </header>
 
-<div class="wrap">
+<nav class="tabs" id="tabs">
+  <button class="tab on" data-pane="board">比价表</button>
+  <button class="tab" data-pane="rank">折扣榜</button>
+  <button class="tab" data-pane="hold">我的库存</button>
+  <button class="tab" data-pane="calc">计算器</button>
+</nav>
+
+<div class="wrap pane" id="pane-board">
   <div class="warnbar" id="disc"></div>
   <div class="kpi" id="kpi"></div>
 
@@ -165,6 +251,111 @@ tr.calcrow:hover td{background:var(--panel)}
     <b>★</b> 收藏会存在你自己的浏览器里，换设备不同步。<b>搜物品</b>匹配物品全名，多个词用空格分开是「都要有」。<br>
     数据来自 Steam 社区市场公开页面与第三方站点，<b>有 5～15 分钟延迟</b>，
     下单前请点物品名去官方页面核对实时价格。
+  </div>
+</div>
+
+<div class="wrap pane" id="pane-rank" hidden>
+  <div class="rankbar">
+    <div class="f"><label>折现系数</label>
+      <input type="number" id="rDisc" step="0.01" value="0.80"
+        title="余额当现金用大约打这个折"></div>
+    <div class="f"><label>买入价 ¥≥</label>
+      <input type="number" id="rMin" step="1" value="3"></div>
+    <div class="f"><label>买入价 ¥≤</label>
+      <input type="number" id="rMax" step="10" value="20000"></div>
+    <label class="ck"><input type="checkbox" id="rSafe" checked>
+      排除卖不掉的</label>
+    <label class="ck"><input type="checkbox" id="rOnlyWin">
+      只看真能赚的</label>
+    <span class="tip" id="rankTip"></span>
+  </div>
+  <div class="cards" id="rankList"></div>
+  <div class="empty" id="rankEmpty" style="display:none">
+    按现在的条件没有能赚的。把「只看真能赚的」取消掉，看看最接近的差多少。
+  </div>
+  <div class="legend">
+    <b>怎么看这张榜</b>：每张卡片第一行是<span class="good">人话</span>——
+    「花 ¥X 买 → Steam 上卖掉 → 余额能当 ¥Y 花」，后面那个<b>折扣</b>就是这件事的划算程度，
+    数字越大越好（<b>8 折</b> 意思是花 80 块拿到 100 块余额）。<br>
+    <b>为什么不用面值比</b>：面值比是「余额 ÷ 现金」，看着 1.25 很漂亮，可余额不是现金。
+    乘上折现系数之后还剩多少，才是真到手的。所以榜里排序用的是折现后的净赚。<br>
+    <b>「排除卖不掉的」</b>会挡掉买盘深度太浅（前 10 档承接不到 10 件）和
+    挂单件数太少（最低挂单价不可信）的物品 —— 看着有价、真去卖却没人接，是最常见的坑。<br>
+    <b>＋ 按钮</b>把物品记进「我的库存」，之后在那边能看到它涨了还是跌了。
+  </div>
+</div>
+
+<div class="wrap pane" id="pane-hold" hidden>
+  <div class="holdsum" id="holdSum"></div>
+  <div class="holdbar">
+    <div class="f"><label>加一件到库存</label>
+      <select id="holdPick"><option value="">— 从榜上选 —</option></select></div>
+    <button class="btn" id="holdAdd">加进去</button>
+    <button class="btn" id="holdRefresh" title="按当前行情重算一遍">重算</button>
+    <button class="btn" id="holdCsv">导出 CSV</button>
+    <button class="btn" id="holdClear" title="清空全部库存记录">清空</button>
+  </div>
+  <table>
+    <thead><tr>
+      <th class="name">物品</th>
+      <th>持有</th>
+      <th>买入均价</th>
+      <th>现在能卖</th>
+      <th>面值比</th>
+      <th>折现后</th>
+      <th>盈亏</th>
+      <th class="hide-s">记下时</th>
+      <th></th>
+    </tr></thead>
+    <tbody id="holdTb"></tbody>
+  </table>
+  <div class="empty" id="holdEmpty" style="display:none">
+    还没有记录。在「折扣榜」或「比价表」里点 ＋ 就能记一件进来。
+  </div>
+  <div class="spark" id="sparkBox" style="display:none">
+    <div class="hd" id="sparkHd"></div>
+    <svg id="sparkSvg" viewBox="0 0 600 64" preserveAspectRatio="none"></svg>
+  </div>
+  <div class="legend">
+    <b>这里记的是「你打算买或已经买了的东西」</b>，存在你自己浏览器里，不上传、别人看不到。<br>
+    <b>买入均价</b>是你记下它时第三方的价格；<b>现在能卖</b>是这一轮采到的 Steam 求购价扣掉手续费。
+    两个一比，就知道这几天是涨了还是跌了。<br>
+    <b>盈亏</b> = 现在卖掉折现后的钱 − 当初花的钱。正数才是真赚。<br>
+    数据每 30 分钟更新一轮，所以「涨跌」是分钟级的，不是实时逐笔 —— 别拿它当炒股软件。
+  </div>
+</div>
+
+<div class="wrap pane" id="pane-calc" hidden>
+  <div class="calcbox">
+    <div class="calcform">
+      <div class="f"><label>我打算花多少钱（真钱，人民币）</label>
+        <input type="number" id="cCash" step="10" value="500"></div>
+      <div class="f"><label>或者：我要多少 Steam 余额</label>
+        <input type="number" id="cWant" step="10" placeholder="填了就按这个算"></div>
+      <div class="f"><label>折现系数（余额当现金用的折扣）</label>
+        <input type="number" id="cDisc" step="0.01" value="0.80"></div>
+      <div class="f"><label>从哪批物品里挑</label>
+        <select id="cPool">
+          <option value="all">全部（按折现后最赚排）</option>
+          <option value="safe">排除卖不掉的</option>
+          <option value="fav">只用我收藏的</option>
+        </select></div>
+      <div class="f"><label>单件最多花 ¥</label>
+        <input type="number" id="cMaxOne" step="10" value="200"></div>
+    </div>
+    <div>
+      <div class="calcout" id="calcOut"></div>
+      <div id="calcPlan"></div>
+      <div class="legend" style="margin-top:16px">
+        <b>这个计算器在算什么</b>：给定一笔钱，从当前行情里挑出最划算的组合，
+        告诉你大概能拿到多少余额、折成现金还剩多少、净赚多少。<br>
+        <b>它是估算，不是承诺</b>：每件能买几件受第三方库存限制，
+        同一件买多了求购价会被你打穿（榜单里已经按买盘深度做了限制），
+        而且行情每 30 分钟变一次。真实下单前请按单件去核对。<br>
+        <b>余额不是现金</b>：折现系数 0.8 的意思是 100 块余额大约能当 80 块用掉
+        （买游戏、送礼物、找人收）。这个数只能你自己定，本站不参与任何交易。
+      </div>
+    </div>
   </div>
 </div>
 
@@ -259,6 +450,7 @@ function readUrl(){
     if(p.has(k)) $(id).value = p.get(k);
   }
   if(p.get('fav') === '1') FAVONLY = true;
+  if(p.get('tab')) showTab(p.get('tab'));
 }
 
 function writeUrl(){
@@ -273,6 +465,7 @@ function writeUrl(){
     if(!same) p.set(URL_KEY[id], raw);
   }
   if(FAVONLY) p.set('fav', '1');
+  if(TAB !== 'board') p.set('tab', TAB);
   const s = p.toString();
   history.replaceState(null, '', s ? '#' + s : location.pathname + location.search);
 }
@@ -306,6 +499,10 @@ async function load(){
       warn.push('⚠ ' + j.fx_note + '。');
     $('disc').textContent = (warn.length ? warn.join(' ') + ' ' : '') + (j.note || '');
     $('disc').classList.toggle('stale', warn.length > 0);
+    // 数据到了就记一个组合面值点，库存那边的涨跌线靠这个画
+    HOLD = loadHold();
+    HIST = loadHist();
+    snap();
   }catch(e){
     $('stamp').textContent = '数据加载失败：' + e.message;
     $('disc').textContent = '找不到 data/latest.json。本地预览先跑：'
@@ -421,6 +618,12 @@ function calcRow(it, d){
   warnBox.style.display = 'none';
   wrap.appendChild(warnBox);
 
+  // 在表里看到中意的，顺手记进库存，不用切页签再找一遍
+  const addBtn = el('button', 'btn', '记进库存');
+  addBtn.style.fontSize = '11.5px'; addBtn.style.padding = '4px 9px';
+  addBtn.dataset.hold = it.n;
+  wrap.appendChild(addBtn);
+
   const fill = () => {
     const k = Math.max(1, Math.floor(QTY[it.n] || 1));
     const cost = (it.buy ?? 0) * k;
@@ -519,6 +722,11 @@ function render(){
     if(OPEN === it.n) frag.appendChild(calcRow(it, d).tr);
   }
   tb.appendChild(frag);
+
+  // 折现系数、筛选一变，别的页签也得跟着变 —— 否则切过去看到的还是旧数
+  if(TAB === 'rank') renderRank();
+  if(TAB === 'hold') renderHold();
+  if(TAB === 'calc') renderCalc();
 }
 
 /* ---- CSV 导出：把当前筛选结果带走 ---- */
@@ -552,6 +760,541 @@ function exportCsv(){
   setTimeout(() => URL.revokeObjectURL(a.href), 3000);
 }
 
+/* ================= 页签 ================= */
+const TABS = ['board', 'rank', 'hold', 'calc'];
+let TAB = 'board';
+
+function showTab(t){
+  if(!TABS.includes(t)) t = 'board';
+  TAB = t;
+  for(const x of TABS) $('pane-' + x).hidden = (x !== t);
+  document.querySelectorAll('#tabs .tab').forEach(b =>
+    b.classList.toggle('on', b.dataset.pane === t));
+  if(t === 'rank') renderRank();
+  if(t === 'hold'){
+    // 涨跌线要后端的历史，第一次进来才去取
+    renderHold();
+    if(!HISTAPI){
+      loadHistApi().then(() => { if(TAB === 'hold') renderHold(); });
+    }
+  }
+  if(t === 'calc') renderCalc();
+  writeUrl();
+}
+document.querySelectorAll('#tabs .tab').forEach(b =>
+  b.addEventListener('click', () => showTab(b.dataset.pane)));
+
+/* ---- 折现系数只有一个，三处输入框跟着同步 ----
+   之前比价表一个、别处再各来一个的话，改了一处另一处不动，
+   看榜的人和算账的人会用两个不同的数，结果对不上。 */
+const DISC_KEY = 'steam-arb-disc';
+
+function setDisc(v){
+  const x = (isFinite(v) && v > 0) ? v : DISC_DEFAULT;
+  for(const id of ['fDisc', 'rDisc', 'cDisc']){
+    if($(id)) $(id).value = x;
+  }
+  try{ localStorage.setItem(DISC_KEY, String(x)); }catch(e){}
+  $('fDiscLabel').textContent = `折现系数（≥${fmt(1/x, 2)} 才不亏）`;
+}
+function loadDisc(){
+  try{
+    const v = parseFloat(localStorage.getItem(DISC_KEY));
+    if(isFinite(v) && v > 0) return v;
+  }catch(e){}
+  return DISC_DEFAULT;
+}
+
+/* ================= 折扣榜 =================
+   面值比是给懂行的人看的，新来的人看到 1.25 不知道那算好还是坏。
+   这里换个说法：花多少钱、拿到多少余额、等于打几折、最后净赚多少。 */
+function rankDisc(){ return disc(); }
+
+function safeOk(it){
+  // 买盘深度太浅 = 你的货卖不掉；挂单件数太少 = 最低挂单价不可信。
+  // 这两条和采集端的两道门是同一个判断，前端再挡一次是为了让「排除卖不掉的」
+  // 这个开关真的能起作用，而不是只在文案里说说。
+  return (it.depth ?? 0) >= 10 && (it.sell_orders ?? 0) >= 10;
+}
+
+function rankRows(){
+  const d = rankDisc();
+  const lo = parseFloat($('rMin').value) || 0;
+  const hiRaw = parseFloat($('rMax').value);
+  const hi = isFinite(hiRaw) ? hiRaw : Infinity;
+  const onlyWin = $('rOnlyWin').checked;
+  const safe = $('rSafe').checked;
+
+  let rows = RAW.filter(it => (it.net ?? 0) > 0 && (it.buy ?? 0) > 0 && it.ratio != null);
+  rows = rows.filter(it => (it.buy ?? 0) >= lo && (it.buy ?? 0) <= hi);
+  if(safe) rows = rows.filter(safeOk);
+  // 折现后净赚：余额不是现金，这一项才是真到手的钱
+  rows = rows.map(it => ({...it, cash: (it.net ?? 0) * d - (it.buy ?? 0)}));
+  if(onlyWin) rows = rows.filter(it => it.cash > 0);
+  rows.sort((a, b) => (b.ratio ?? 0) - (a.ratio ?? 0));
+  return rows;
+}
+
+function renderRank(){
+  const box = $('rankList');
+  box.textContent = '';
+  const d = rankDisc();
+  const rows = rankRows();
+  $('rankEmpty').style.display = rows.length ? 'none' : 'block';
+  $('rankTip').textContent = rows.length
+    ? `按折扣从好到差，共 ${rows.length} 件`
+    : '';
+  if(!rows.length) return;
+
+  const frag = document.createDocumentFragment();
+  rows.slice(0, 60).forEach((it, i) => {
+    const card = el('div', 'card' + (i < 3 ? ' top' + (i + 1) : ''));
+    card.appendChild(el('div', 'rk', String(i + 1)));
+
+    const body = el('div', 'cbody');
+    const nm = el('div', 'cname');
+    const zh = zhName(it.n);
+    nm.appendChild(el('span', null, zh || it.n));
+    if(zh) nm.appendChild(el('span', 'en', it.n));
+    body.appendChild(nm);
+
+    // 人话第一句：花多少、拿多少、等于几折
+    const deal = el('div', 'deal');
+    const disc10 = (it.buy / it.net) * 10;
+    const cls = disc10 <= 8.5 ? '' : (disc10 <= 10 ? ' warn' : ' bad');
+    deal.appendChild(document.createTextNode('花 '));
+    deal.appendChild(el('b', null, '¥' + fmt(it.buy)));
+    deal.appendChild(document.createTextNode(' 买 → 卖掉净得 '));
+    deal.appendChild(el('b', null, '¥' + fmt(it.net)));
+    deal.appendChild(document.createTextNode(' 余额'));
+    const off = el('span', 'off' + cls, fmt(disc10, 1) + ' 折');
+    off.title = '折数 = 花的钱 ÷ 拿到的余额，越小越划算';
+    deal.appendChild(off);
+    body.appendChild(deal);
+
+    // 第二句：折成现金之后还剩多少
+    const meta = el('div', 'cmeta');
+    const cashTxt = it.cash >= 0
+      ? `折现后能当 ¥${fmt(it.net * d)} 用，净赚 +¥${fmt(it.cash)}`
+      : `折现后只值 ¥${fmt(it.net * d)}，反而亏 ¥${fmt(-it.cash)}`;
+    meta.appendChild(el('span', it.cash >= 0 ? 'good' : 'bad', cashTxt));
+    meta.appendChild(el('span', 'sub',
+      `买盘深度 ${it.depth ?? '—'} 件 · 第三方库存 ${it.qty ?? '—'} 件 · ${it.src || '—'}`));
+    body.appendChild(meta);
+    card.appendChild(body);
+
+    const add = el('button', 'btn add', '＋');
+    add.title = '记进我的库存';
+    add.dataset.add = it.n;
+    card.appendChild(add);
+    frag.appendChild(card);
+  });
+  box.appendChild(frag);
+}
+
+/* ================= 我的库存 =================
+   记的是「我买了 / 打算买的」，存在 localStorage 里，不上传。
+   每轮数据到的时候顺手存一个总面值快照，用来画涨跌线。 */
+const HOLD_KEY = 'steam-arb-hold';
+const HIST_KEY = 'steam-arb-hist';
+let HOLD = {};
+let HIST = [];
+
+function loadHold(){
+  try{ return JSON.parse(localStorage.getItem(HOLD_KEY) || '{}') || {}; }
+  catch(e){ return {}; }
+}
+function saveHold(){
+  try{ localStorage.setItem(HOLD_KEY, JSON.stringify(HOLD)); }catch(e){}
+}
+function loadHist(){
+  try{
+    const a = JSON.parse(localStorage.getItem(HIST_KEY) || '[]');
+    return Array.isArray(a) ? a : [];
+  }catch(e){ return []; }
+}
+function saveHist(){
+  try{ localStorage.setItem(HIST_KEY, JSON.stringify(HIST)); }catch(e){}
+}
+
+function addHold(n, qty){
+  const it = RAW.find(x => x.n === n);
+  if(!it) return;
+  const q = Math.max(1, Math.floor(qty || 1));
+  const cur = HOLD[n];
+  if(cur){
+    // 加仓按加权均价，不然第二次买进来会把成本价直接盖掉
+    const total = cur.qty + q;
+    cur.buy = ((cur.buy || 0) * cur.qty + (it.buy || 0) * q) / total;
+    cur.qty = total;
+  }else{
+    HOLD[n] = {
+      qty: q,
+      buy: it.buy || 0,
+      at: Math.floor(Date.now() / 1000),
+      net0: it.net || 0,     // 记下时的净得，用来算这几天涨了还是跌了
+    };
+  }
+  saveHold();
+  snap();
+  // 不切页签 —— 在榜上翻东西的时候被拽走很烦。给个短提示就够了。
+  toast(`已记入库存：${zhName(n) || n} ×${q}`);
+  if(TAB === 'hold') renderHold();
+  if(TAB === 'rank') renderRank();
+}
+
+/* 一句话提示，2 秒后自己消失 */
+let TOAST_T = 0;
+function toast(msg){
+  let box = $('toast');
+  if(!box){
+    box = el('div');
+    box.id = 'toast';
+    document.body.appendChild(box);
+  }
+  box.textContent = msg;
+  box.classList.add('on');
+  clearTimeout(TOAST_T);
+  TOAST_T = setTimeout(() => box.classList.remove('on'), 2000);
+}
+
+/* 后端按天记的历史（data/hist.json）。只有进「我的库存」页才去取 ——
+   首屏不该为了一个多数人不看的页签多下几百 KB。
+   取不到就退回浏览器本地攒的点，功能降级但不断。 */
+let HISTAPI = null;
+let HISTLOADING = false;
+
+async function loadHistApi(){
+  if(HISTAPI || HISTLOADING) return;
+  HISTLOADING = true;
+  const q = new URLSearchParams(location.search);
+  try{
+    const r = await fetch(q.get('hist') || 'data/hist.json', {cache:'no-store'});
+    if(r.ok) HISTAPI = (await r.json()).series || {};
+  }catch(e){ /* 没有就只用本地的 */ }
+  HISTLOADING = false;
+}
+
+/* 从按天历史里算出某件物品的涨跌，返回 {pct, from, to, n} 或 null */
+function trendOf(name){
+  const s = HISTAPI && HISTAPI[name];
+  if(!s || s.length < 2) return null;
+  const first = s[0], last = s[s.length - 1];
+  if(!first[1]) return null;
+  return {pct: (last[1] - first[1]) / first[1] * 100, from: first[1],
+          to: last[1], n: s.length, days: Math.round((last[0] - first[0]) / 86400) + 1};
+}
+function snap(){
+  const names = Object.keys(HOLD);
+  if(!names.length) return;
+  let face = 0, ok = false;
+  for(const n of names){
+    const it = RAW.find(x => x.n === n);
+    if(it && it.net != null){ face += it.net * HOLD[n].qty; ok = true; }
+  }
+  if(!ok) return;
+  const ts = Math.floor(Date.now() / 1000);
+  if(HIST.length && ts - HIST[HIST.length - 1].ts < 60){
+    HIST[HIST.length - 1].v = face;
+  }else{
+    HIST.push({ts, v: face});
+  }
+  if(HIST.length > 240) HIST = HIST.slice(-240);
+  saveHist();
+}
+
+/* 组合面值走势。优先用后端按天记的历史（关掉页面那些天也不会丢），
+   没有才退回浏览器自己攒的点。 */
+function portSeries(){
+  const names = Object.keys(HOLD);
+  if(!names.length) return [];
+  if(HISTAPI){
+    // 把持仓里每件的按天净得按天加起来 —— 这才是「我这堆东西值多少」
+    const byDay = new Map();
+    let hit = 0;
+    for(const n of names){
+      const s = HISTAPI[n];
+      if(!s) continue;
+      hit++;
+      for(const [day, net] of s){
+        byDay.set(day, (byDay.get(day) || 0) + net * HOLD[n].qty);
+      }
+    }
+    if(hit){
+      return [...byDay.entries()].sort((a, b) => a[0] - b[0])
+        .map(([ts, v]) => ({ts, v}));
+    }
+  }
+  return HIST;
+}
+
+function renderSpark(){
+  const box = $('sparkBox'), svg = $('sparkSvg');
+  const series = portSeries();
+  if(series.length < 2){ box.style.display = 'none'; return; }
+  box.style.display = '';
+  const vs = series.map(p => p.v);
+  const lo = Math.min(...vs), hi = Math.max(...vs);
+  const span = (hi - lo) || 1;
+  const W = 600, H = 64, pad = 4;
+  const x = i => (i / (series.length - 1)) * W;
+  const y = v => H - pad - ((v - lo) / span) * (H - pad * 2);
+  const pts = series.map((p, i) => `${x(i).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ');
+  const up = vs[vs.length - 1] >= vs[0];
+  const col = up ? '#4ade80' : '#f87171';
+  svg.innerHTML = '';
+  const mk = (tag, attrs) => {
+    const e = document.createElementNS('http://www.w3.org/2000/svg', tag);
+    for(const k in attrs) e.setAttribute(k, attrs[k]);
+    return e;
+  };
+  // 面积：从线到基线，让「涨了多少」有个体积感
+  svg.appendChild(mk('polygon', {
+    points: `0,${H} ${pts} ${W},${H}`,
+    fill: up ? 'rgba(74,222,128,.12)' : 'rgba(248,113,113,.12)',
+  }));
+  svg.appendChild(mk('polyline', {
+    points: pts, fill: 'none', stroke: col, 'stroke-width': '1.6',
+    'vector-effect': 'non-scaling-stroke',
+  }));
+  const first = series[0], last = series[series.length - 1];
+  const pct = first.v ? ((last.v - first.v) / first.v) * 100 : 0;
+  const span_days = Math.round((last.ts - first.ts) / 86400) + 1;
+  const src = HISTAPI ? `最近 ${span_days} 天（按天）` : `${series.length} 个记录点`;
+  $('sparkHd').textContent =
+    `组合面值走势　${src}　从 ¥${fmt(first.v)} → ¥${fmt(last.v)}` +
+    `（${pct >= 0 ? '+' : ''}${fmt(pct, 1)}%）`;
+}
+
+function renderHold(){
+  const d = disc();
+  const tb = $('holdTb');
+  tb.textContent = '';
+  const names = Object.keys(HOLD);
+  $('holdEmpty').style.display = names.length ? 'none' : 'block';
+
+  let cash = 0, cost = 0, face = 0, pieces = 0, bad = 0;
+  const rows = [];
+  for(const n of names){
+    const h = HOLD[n];
+    const it = RAW.find(x => x.n === n) || null;
+    const net = it ? (it.net ?? null) : null;
+    const buy = h.buy || 0;
+    const q = h.qty || 1;
+    pieces += q;
+    cost += buy * q;
+    if(net == null){ bad++; }
+    else{
+      face += net * q;
+      cash += net * d * q;
+    }
+    rows.push({n, h, it, net, q, buy, pnl: net == null ? null : (net * d - buy) * q});
+  }
+  rows.sort((a, b) => (b.pnl ?? -Infinity) - (a.pnl ?? -Infinity));
+
+  const sum = $('holdSum');
+  sum.textContent = '';
+  const cell = (k, v, cls) => {
+    const w = el('div', null, k);
+    w.appendChild(el('b', cls, v));
+    sum.appendChild(w);
+  };
+  cell('持有', pieces + ' 件');
+  cell('买入成本', '¥' + fmt(cost));
+  cell('现在能卖（余额）', '¥' + fmt(face));
+  cell('折现后值', '¥' + fmt(cash));
+  cell('净盈亏', (cash - cost >= 0 ? '+' : '') + '¥' + fmt(cash - cost),
+       cash - cost >= 0 ? 'good' : 'bad');
+  if(cost > 0)
+    cell('回报率', ((cash - cost) / cost * 100).toFixed(1) + '%',
+         cash - cost >= 0 ? 'good' : 'bad');
+  if(bad) cell('行情里没有', bad + ' 件', 'mid');
+
+  const frag = document.createDocumentFragment();
+  for(const r of rows){
+    const tr = el('tr');
+    const tdN = el('td', 'name');
+    const zh = zhName(r.n);
+    const a = el('a', null, zh || r.n);
+    a.href = steamUrl(r.n); a.target = '_blank'; a.rel = 'noopener noreferrer';
+    if(zh) a.title = r.n;
+    tdN.appendChild(a);
+    if(zh) tdN.appendChild(el('span', 'en', r.n));
+    if(r.it) tdN.appendChild(el('span', 'ptag', r.it.src || ''));
+    else tdN.appendChild(el('span', 'ptag', '行情里没了'));
+    tr.appendChild(tdN);
+
+    tr.appendChild(el('td', null, r.q + ' 件'));
+    tr.appendChild(el('td', null, '¥' + fmt(r.buy)));
+    tr.appendChild(el('td', null, r.net == null ? '—' : '¥' + fmt(r.net)));
+
+    const tdR = el('td');
+    if(r.it && r.it.ratio != null){
+      const cls = r.it.ratio >= 1.05 ? 'good' : (r.it.ratio >= 1 ? 'mid' : 'bad');
+      tdR.appendChild(el('span', cls, fmt(r.it.ratio, 3)));
+      // 涨跌优先用后端按天记的历史（关掉页面那几天也在），
+      // 没有才退回「记下时的净得」和现在比 —— 后者只能反映你记下之后的变化。
+      const tr = trendOf(r.n);
+      if(tr && Math.abs(tr.pct) >= 0.05){
+        const sp = el('span', 'sub' + (tr.pct >= 0 ? ' good' : ' bad'),
+          (tr.pct >= 0 ? '▲ +' : '▼ ') + fmt(tr.pct, 1) + '%');
+        sp.title = `${tr.days} 天前 ¥${fmt(tr.from)} → 现在 ¥${fmt(tr.to)}`;
+        tdR.appendChild(sp);
+      }else{
+        const n0 = r.h.net0 || 0;
+        if(n0 > 0 && r.net != null){
+          const ch = (r.net - n0) / n0 * 100;
+          if(Math.abs(ch) >= 0.05)
+            tdR.appendChild(el('span', 'sub' + (ch >= 0 ? ' good' : ' bad'),
+              (ch >= 0 ? '▲ +' : '▼ ') + fmt(ch, 1) + '%'));
+        }
+      }
+    }else tdR.textContent = '—';
+    tr.appendChild(tdR);
+
+    tr.appendChild(el('td', null, r.net == null ? '—' : '¥' + fmt(r.net * d)));
+    tr.appendChild(el('td', r.pnl == null ? null : (r.pnl >= 0 ? 'good' : 'bad'),
+      r.pnl == null ? '—' : (r.pnl >= 0 ? '+' : '') + '¥' + fmt(r.pnl)));
+    tr.appendChild(el('td', 'hide-s',
+      r.h.at ? new Date(r.h.at * 1000).toLocaleDateString('zh-CN') : '—'));
+
+    const tdX = el('td');
+    const del = el('button', 'btn', '删');
+    del.style.fontSize = '11.5px'; del.style.padding = '3px 8px';
+    del.dataset.del = r.n;
+    tdX.appendChild(del);
+    tr.appendChild(tdX);
+    frag.appendChild(tr);
+  }
+  tb.appendChild(frag);
+  renderSpark();
+
+  // 加一件的下拉：按折扣排，别让人自己在几百件里翻
+  const sel = $('holdPick');
+  const keep = sel.value;
+  sel.textContent = '';
+  sel.appendChild(el('option', null, '— 从榜上选 —')).value = '';
+  for(const it of rankRows().slice(0, 300)){
+    const o = el('option', null,
+      `${fmt((it.buy / it.net) * 10, 1)} 折　${zhName(it.n) || it.n}　¥${fmt(it.buy)}`);
+    o.value = it.n;
+    sel.appendChild(o);
+  }
+  if(keep) sel.value = keep;
+}
+
+/* ================= 计算器 =================
+   给定一笔钱，按当前行情挑最划算的组合。受三件事限制：
+   第三方库存（能买几件）、买盘深度（卖得掉几件）、单件预算上限。 */
+function calcPool(){
+  const mode = $('cPool').value;
+  let rows = RAW.filter(it => (it.net ?? 0) > 0 && (it.buy ?? 0) > 0 && it.ratio != null);
+  if(mode === 'safe') rows = rows.filter(safeOk);
+  if(mode === 'fav') rows = rows.filter(it => FAV.has(it.n));
+  rows.sort((a, b) => (b.ratio ?? 0) - (a.ratio ?? 0));
+  return rows;
+}
+
+function renderCalc(){
+  const d = disc();
+  const maxOneRaw = parseFloat($('cMaxOne').value);
+  const maxOne = isFinite(maxOneRaw) && maxOneRaw > 0 ? maxOneRaw : Infinity;
+  const wantRaw = parseFloat($('cWant').value);
+  const want = (isFinite(wantRaw) && wantRaw > 0) ? wantRaw : 0;
+  const cashRaw = parseFloat($('cCash').value);
+  const budget = (isFinite(cashRaw) && cashRaw > 0) ? cashRaw : 500;
+
+  const rows = calcPool().filter(it => (it.buy ?? 0) <= maxOne);
+  const plan = [];
+  let spent = 0, face = 0;
+  const capCash = want > 0 ? Infinity : budget;
+
+  for(const it of rows){
+    if(want > 0 && face >= want) break;
+    if(want === 0 && spent >= capCash) break;
+    const per = it.buy;
+    const net = it.net;
+    // 库存和深度哪个小听哪个；再多买也没人接
+    let k = Math.min(it.qty ?? 1, it.depth ?? 1);
+    if(!(k >= 1)) continue;
+    if(want === 0){
+      k = Math.min(k, Math.floor((capCash - spent) / per));
+    }else{
+      k = Math.min(k, Math.max(1, Math.ceil((want - face) / net)));
+    }
+    if(!(k >= 1)) continue;
+    plan.push({n: it.n, k, per, net, it});
+    spent += k * per;
+    face += k * net;
+  }
+
+  const out = $('calcOut');
+  out.textContent = '';
+  const cell = (k, v, cls) => {
+    const w = el('div', 'cell');
+    w.appendChild(el('i', null, k));
+    w.appendChild(el('b', cls, v));
+    out.appendChild(w);
+  };
+  const cashValue = face * d;
+  const pnl = cashValue - spent;
+  // 一件候选都没有的时候，别显示一排 ¥0.00 —— 那看着像「算了，结果是 0」，
+  // 其实是「没东西可算」，两者得能分开。
+  const dash = rows.length ? null : '—';
+  const n2 = v => dash || v;
+  cell('要花真钱', n2('¥' + fmt(spent)));
+  cell('拿到余额', n2('¥' + fmt(face)));
+  cell('余额折现后', n2('¥' + fmt(cashValue)));
+  cell('净赚', n2((pnl >= 0 ? '+' : '') + '¥' + fmt(pnl)), dash ? null : (pnl >= 0 ? 'good' : 'bad'));
+  cell('回报率', n2(spent > 0 ? ((pnl / spent) * 100).toFixed(1) + '%' : '—'),
+       dash ? null : (pnl >= 0 ? 'good' : 'bad'));
+  cell('平均折扣', n2(face > 0 ? fmt(spent / face * 10, 2) + ' 折' : '—'));
+  if(want > 0) cell('离目标还差', n2('¥' + fmt(Math.max(0, want - face))));
+  else cell('预算还剩', n2('¥' + fmt(Math.max(0, budget - spent))));
+
+  const box = $('calcPlan');
+  box.textContent = '';
+  if(!rows.length){
+    const why = $('cPool').value === 'fav'
+      ? '你还没有收藏任何物品。先去「比价表」或「折扣榜」点 ★ 收几件，再回来算。'
+      : ($('cPool').value === 'safe'
+         ? '「排除卖不掉的」把候选全挡掉了 —— 现在的行情里没有既划算又卖得掉的。'
+         : '当前行情里没有可用的物品，可能是采集还没成功过。');
+    box.appendChild(el('div', 'empty', why));
+    return;
+  }
+  if(!plan.length){
+    box.appendChild(el('div', 'empty',
+      `有 ${rows.length} 件候选，但单件都超过 ¥${fmt(maxOne)} 的上限，凑不出一件。`
+      + '把「单件最多花」放宽一点。'));
+    return;
+  }
+  const t = el('table');
+  const thead = el('thead');
+  const hr = el('tr');
+  for(const h of ['物品', '买几件', '单价', '小计', '卖掉的余额'])
+    hr.appendChild(el('th', null, h));
+  thead.appendChild(hr);
+  t.appendChild(thead);
+  const tbody = el('tbody');
+  for(const p of plan.slice(0, 20)){
+    const tr = el('tr');
+    const tdN = el('td', 'name');
+    tdN.appendChild(el('a', null, zhName(p.n) || p.n)).href = steamUrl(p.n);
+    tr.appendChild(tdN);
+    tr.appendChild(el('td', null, p.k + ' 件'));
+    tr.appendChild(el('td', null, '¥' + fmt(p.per)));
+    tr.appendChild(el('td', null, '¥' + fmt(p.per * p.k)));
+    tr.appendChild(el('td', null, '¥' + fmt(p.net * p.k)));
+    tbody.appendChild(tr);
+  }
+  t.appendChild(tbody);
+  box.appendChild(t);
+  if(plan.length > 20)
+    box.appendChild(el('div', 'meta',
+      `还有 ${plan.length - 20} 件没列出来，上面这些已经够把预算用掉了。`));
+}
+
 /* ---- 交互 ---- */
 document.querySelectorAll('th[data-k]').forEach(th => {
   th.addEventListener('click', () => {
@@ -563,6 +1306,8 @@ document.querySelectorAll('th[data-k]').forEach(th => {
 
 FIELDS.forEach(id => $(id).addEventListener('input', () => {
   if(id === 'fMin' || id === 'fMax') syncChips();
+  // 折现系数在三个页签都有，改一处三处一起变
+  if(id === 'fDisc') setDisc(parseFloat($('fDisc').value));
   writeUrl();
   render();
 }));
@@ -581,10 +1326,13 @@ $('tb').addEventListener('click', e => {
     const n = star.dataset.n;
     if(FAV.has(n)) FAV.delete(n); else FAV.add(n);
     saveFav(); render();
+    // 计算器可能在用收藏池，收藏变了要重算 —— 不然切过去看到的还是旧方案
+    if(TAB === 'calc') renderCalc();
     return;
   }
   if(e.target.closest('a')) return;          // 链接照常跳转
   if(e.target.closest('input')) return;      // 输入框里点不收起
+  if(e.target.closest('button')) return;     // 「记进库存」不该顺手把行也展开
   const tr = e.target.closest('tr[data-n]');
   if(!tr) return;
   OPEN = (OPEN === tr.dataset.n) ? null : tr.dataset.n;
@@ -598,6 +1346,95 @@ $('tb').addEventListener('input', e => {
   const n = inp.dataset.q;
   QTY[n] = Math.max(1, Math.floor(parseFloat(inp.value) || 1));
   if(FILL[n]) FILL[n]();
+});
+
+/* ---- 三个页签的输入 ---- */
+$('rDisc').addEventListener('input', () => {
+  setDisc(parseFloat($('rDisc').value));
+  renderRank();
+});
+$('cDisc').addEventListener('input', () => {
+  setDisc(parseFloat($('cDisc').value));
+  renderCalc();
+});
+['rMin', 'rMax'].forEach(id =>
+  $(id).addEventListener('input', renderRank));
+['rOnlyWin', 'rSafe'].forEach(id =>
+  $(id).addEventListener('change', renderRank));
+['cCash', 'cWant', 'cMaxOne'].forEach(id =>
+  $(id).addEventListener('input', renderCalc));
+$('cPool').addEventListener('change', renderCalc);
+
+// 折扣榜里点 ＋
+$('rankList').addEventListener('click', e => {
+  const b = e.target.closest('[data-add]');
+  if(!b) return;
+  addHold(b.dataset.add, 1);
+});
+
+// 比价表算账行里的「记进库存」
+$('tb').addEventListener('click', e => {
+  const b = e.target.closest('[data-hold]');
+  if(!b) return;
+  e.stopPropagation();
+  addHold(b.dataset.hold, QTY[b.dataset.hold] || 1);
+});
+
+// 库存表里删一件
+$('holdTb').addEventListener('click', e => {
+  const b = e.target.closest('[data-del]');
+  if(!b) return;
+  delete HOLD[b.dataset.del];
+  saveHold();
+  renderHold();
+});
+
+$('holdAdd').addEventListener('click', () => {
+  const n = $('holdPick').value;
+  if(!n) return;
+  addHold(n, 1);
+});
+
+$('holdRefresh').addEventListener('click', () => {
+  HOLD = loadHold();
+  HIST = loadHist();
+  snap();
+  renderHold();
+});
+
+$('holdClear').addEventListener('click', () => {
+  if(!Object.keys(HOLD).length) return;
+  if(!confirm('清空全部库存记录？这个操作不能撤销。')) return;
+  HOLD = {}; HIST = [];
+  saveHold(); saveHist();
+  renderHold();
+});
+
+$('holdCsv').addEventListener('click', () => {
+  const d = disc();
+  const head = ['物品', '物品_英文原名', '持有件数', '买入均价', '现在能卖',
+                '面值比', '折现后单价', '盈亏', '记下时间'];
+  const out = [head.map(csvCell).join(',')];
+  for(const n of Object.keys(HOLD)){
+    const h = HOLD[n];
+    const it = RAW.find(x => x.n === n) || null;
+    const net = it ? (it.net ?? null) : null;
+    const pnl = net == null ? null : (net * d - (h.buy || 0)) * (h.qty || 1);
+    out.push([
+      zhName(n) || n, n, h.qty || 1, fmt(h.buy, 2),
+      net == null ? '' : fmt(net, 2),
+      it && it.ratio != null ? fmt(it.ratio, 4) : '',
+      net == null ? '' : fmt(net * d, 2),
+      pnl == null ? '' : fmt(pnl, 2),
+      h.at ? new Date(h.at * 1000).toISOString().slice(0, 16).replace('T', ' ') : '',
+    ].map(csvCell).join(','));
+  }
+  const blob = new Blob(['\ufeff' + out.join('\r\n')], {type:'text/csv;charset=utf-8'});
+  const a = el('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'steam-arb-hold-' + new Date().toISOString().slice(0,10) + '.csv';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 3000);
 });
 
 // 价位档：只改两个价格输入框，其余筛选不动
@@ -632,7 +1469,8 @@ $('reset').addEventListener('click', () => {
   $('fQ').value = '';
   $('fRatio').value = 1.00; $('fDepth').value = 1;
   $('fMin').value = 3; $('fMax').value = 20000;
-  $('fSrc').value = ''; $('fDisc').value = DISC_DEFAULT;
+  $('fSrc').value = '';
+  setDisc(DISC_DEFAULT);
   FAVONLY = false; OPEN = null;
   document.querySelectorAll('#chips .chip').forEach((c,i) =>
     c.classList.toggle('on', i === 0));
@@ -640,7 +1478,13 @@ $('reset').addEventListener('click', () => {
   writeUrl(); render();
 });
 
+/* ---- 起步 ---- */
+HOLD = loadHold();
+HIST = loadHist();
+setDisc(loadDisc());
 readUrl();
+// readUrl 可能从地址栏里带了一个折现系数回来，得再同步一次到另外两个页签
+setDisc(parseFloat($('fDisc').value));
 syncChips();
 load();
 </script>

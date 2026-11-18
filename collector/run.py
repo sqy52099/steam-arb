@@ -33,8 +33,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fees
 import thirdparty
-from store import (connect, latest_quotes, meta_get, meta_set, purge_old,
-                   stats, upsert_items, upsert_quotes)
+from store import (connect, day_key, hist_series, latest_quotes, meta_get,
+                   meta_set, purge_hist, purge_old, stats, upsert_hist,
+                   upsert_items, upsert_quotes, HIST_DAYS)
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ARB_DATA 让 CI 把产物直接写进 data 分支的克隆目录
@@ -516,6 +517,13 @@ def run_merge(args) -> None:
     gone = purge_old(con, 7)
     if gone:
         log(f"清理 7 天前没再出现的 {gone} 条")
+    # 按天记一笔，给前端画涨跌。一天里跑多少轮都只覆盖当天那一行。
+    hn = upsert_hist(con, rows)
+    if hn:
+        log(f"历史表记下 {hn} 条（{time.strftime('%Y-%m-%d', time.localtime(day_key() + 12*3600))}）")
+    hgone = purge_hist(con, HIST_DAYS)
+    if hgone:
+        log(f"清理 {HIST_DAYS} 天前的历史 {hgone} 条")
     meta_set(con, "last_merge", int(time.time()))
     meta_set(con, "fx", fx)
     if fx_info.get("factor"):
@@ -590,6 +598,22 @@ def export(args, con) -> None:
     os.replace(tmp, fp)
     log(f"导出 {fp}（{len(rows)} 条，{os.path.getsize(fp)/1024:.1f} KB）")
 
+    # 按天历史单独一个文件：只有进「我的库存」页才需要它，
+    # 混进 latest.json 会让首屏多下几百 KB，而绝大多数人根本不看那个页签。
+    hist = hist_series(con, days=HIST_DAYS)
+    hp = os.path.join(DATA, "hist.json")
+    htmp = hp + ".tmp"
+    with open(htmp, "w", encoding="utf-8") as f:
+        json.dump({"days": HIST_DAYS, "series": hist}, f,
+                  ensure_ascii=False, separators=(",", ":"))
+    os.replace(htmp, hp)
+    if hist:
+        pts = sum(len(v) for v in hist.values())
+        log(f"导出 {hp}（{len(hist)} 件 / {pts} 个点，"
+            f"{os.path.getsize(hp)/1024:.1f} KB）")
+    else:
+        log("历史表还没有两天以上的数据，hist.json 是空的（正常，跑几天就有了）")
+
 
 # ---------------- fake：离线跑通两个阶段 ----------------
 
@@ -656,10 +680,19 @@ def merge_fake(args) -> None:
         })
     upsert_quotes(con, rows)
     upsert_items(con, [{"hash_name": it["n"]} for it in items])
+    # 造假数据时顺手往前补几天历史，否则离线看涨跌线永远是空的
+    today = day_key()
+    for back in range(4, 0, -1):
+        fake_hist = []
+        for r in rows:
+            wobble = 1 + (hash(r["hash_name"] + str(back)) % 17 - 8) / 100.0
+            fake_hist.append({**r, "net_cny": round(r["net_cny"] * wobble, 2)})
+        upsert_hist(con, fake_hist, ts=today - back * 86400)
+    upsert_hist(con, rows)
     mark("fx", True, "fake")
     mark("merge", True, f"fake {len(rows)} 条")
     meta_set(con, "fx", fx)
-    log(f"[fake] 入库 {len(rows)} 条")
+    log(f"[fake] 入库 {len(rows)} 条，历史补了 5 天")
     export(args, con)
 
 

@@ -46,6 +46,15 @@ def main() -> int:
     print(f"已构建 {OUT}")
     print(f"  latest.json {size:.1f} KB")
 
+    # 按天历史，只有「我的库存」页签会去取。缺了不影响主表，
+    # 那边的涨跌线退回用浏览器本地攒的点。
+    hp = os.path.join(DATA, "hist.json")
+    if os.path.exists(hp):
+        shutil.copy2(hp, os.path.join(dst_dir, "hist.json"))
+        print(f"  hist.json {os.path.getsize(hp) / 1024:.1f} KB")
+    else:
+        print("  没有 hist.json，库存页的涨跌线只能用浏览器本地的记录")
+
     # 中文名查表。不是每轮都变（CSGO-API 出新的才变），缺了不影响页面能用，
     # 只是物品名退回英文，所以找不到只警告不算失败。
     # 先看 ARB_DATA（CI 里 data 分支被 checkout 到 /tmp），再退回仓库自己的 data/
