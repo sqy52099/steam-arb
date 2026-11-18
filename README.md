@@ -208,7 +208,9 @@ cron 也不能比一轮耗时更密：collect(18) + merge(12) 最坏 30 分钟�
 **想跑一轮看接口回来没有**：
 
 ```
-GitHub → Actions → collect → Run workflow → main → Run
+GitHub → Actions → collect → Run workflow
+  → batch 填 20（默认 120，探情况时用小的，省得又打一轮一整轮请求）
+  → Run
 ```
 
 跑完看 Summary 那张表，`Steam 物品页` 那一行是 ✅ 就说明缓过来了，再把

@@ -22,6 +22,11 @@ on:
   # schedule:
   #   - cron: "*/30 * * * *"
   workflow_dispatch:        # 允许手动点一次，方便第一次验证
+    inputs:
+      batch:
+        description: "每个 shard 采几件（探情况时用小的，20 件约 2 分钟）"
+        required: false
+        default: "120"
   push:
     branches: [main]
     # 只在动到采集/前端时才跑：改了代码就等于顺手验一次，
@@ -70,6 +75,8 @@ jobs:
           USD_CNY: ${{ vars.USD_CNY }}
           STEAM_GAP: "2.5"
           SHARD_ID: ${{ matrix.shard }}
+          # 手动触发时用输入值；定时/push 用默认 120 件、12 分钟。
+          BATCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.batch || '120' }}
           OUT_DIR: /tmp/shards
         run: |
           set +e
@@ -82,7 +89,8 @@ jobs:
           # merge 只有一个 IP，撞上限流就整轮退回汇率、价格全偏高 6%。
           python run.py --mode collect \
             --shard "$SHARD_ID" --shards "$SHARDS" \
-            --batch 120 --deadline 12 --fx-samples 4 --net-give-up 5 \
+            --batch "${BATCH}" --deadline 12 --fx-samples 4 \
+            --net-give-up 5 \
             --out-dir "$OUT_DIR"
           echo "采集 exit=$?"
           # 采不到也要写出空 shard：merge 靠它的 health 判断这一路是被拦还是没数据
