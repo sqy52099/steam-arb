@@ -1,7 +1,7 @@
 name: probe
 
-# 一次性诊断 round 3：验证生产链路「第三方给物品名 → 物品页拿 nameid
-# → itemordershistogram 拿真实求购价」到底跑不跑得通、多快。
+# 一次性诊断 round 4：物品页 200 但找不到 Market_LoadOrderSpread，
+# 说明页面结构变了。把 HTML 捞回来找 nameid 到底在哪。
 # 结果写进 probe-log 分支。用完即删。
 on:
   workflow_dispatch:
@@ -32,47 +32,33 @@ jobs:
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-          HDR = {
-              "User-Agent": UA,
-              "Accept": "application/json, text/plain, */*",
-              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-              "X-Requested-With": "XMLHttpRequest",
-              "Referer": BASE + "/market/",
-          }
           HTML_HDR = {
               "User-Agent": UA,
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "Accept-Encoding": "gzip, deflate",
               "Referer": BASE + "/market/",
           }
-          NAMEID_RE = re.compile(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)")
-
-          ITEMS = [
-              "Prisma Case", "Dreams & Nightmares Case", "Fracture Case",
-              "Recoil Case", "Revolution Case", "Danger Zone Case",
-              "Snakebite Case", "Operation Broken Fang Case", "Kilowatt Case",
-              "Gallery Case",
-          ]
+          NAME = "Prisma Case"
+          url = BASE + "/market/listings/730/" + urllib.parse.quote(NAME)
 
           jar = http.cookiejar.CookieJar()
           OP = urllib.request.build_opener(
               urllib.request.HTTPCookieProcessor(jar))
 
 
-          def fetch(url, headers, timeout=30):
-              req = urllib.request.Request(url, headers=headers)
-              t0 = time.time()
+          def fetch(u, headers, timeout=30):
+              req = urllib.request.Request(u, headers=headers)
               try:
                   with OP.open(req, timeout=timeout) as r:
                       raw = r.read()
                       if r.headers.get("Content-Encoding") == "gzip":
                           raw = gzip.decompress(raw)
-                      return r.status, raw, time.time() - t0
+                      return r.status, raw, dict(r.headers)
               except urllib.error.HTTPError as e:
-                  raw = e.read()[:400]
-                  return e.code, raw, time.time() - t0
+                  return e.code, e.read()[:600], dict(e.headers)
               except Exception as e:
-                  return None, str(e).encode(), time.time() - t0
+                  return None, str(e).encode(), {}
 
 
           print("=== 出口 IP ===")
@@ -83,117 +69,60 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          # ---- A. search/render 再试一次：换成经典参数 ----
-          print("=== A. search/render 经典参数 ===")
-          variants = [
-              ("老参数(带 query=)",
-               BASE + "/market/search/render/?" + urllib.parse.urlencode({
-                   "query": "", "start": 0, "count": 10,
-                   "search_descriptions": 0, "sort_column": "popular",
-                   "sort_dir": "desc", "appid": 730, "norender": 1})),
-              ("完全不带 currency/country",
-               BASE + "/market/search/render/?appid=730&norender=1&count=10"),
-              ("POST 形式",
-               BASE + "/market/search/render/"),
+          st, raw, hdrs = fetch(url, HTML_HDR)
+          text = raw.decode("utf-8", "replace")
+          print("物品页 %s → HTTP %s  %dB" % (NAME, st, len(raw)))
+          print("Content-Encoding: %s" % hdrs.get("Content-Encoding"))
+          print("Content-Type: %s" % hdrs.get("Content-Type"))
+          print("")
+
+          # 找各种可能的 nameid 载体
+          print("=== 关键字扫描 ===")
+          pats = [
+              ("Market_LoadOrderSpread", r"Market_LoadOrderSpread"),
+              ("item_nameid", r"item_nameid"),
+              ("itemNameId", r"itemNameId"),
+              ("g_rgMarketItemNameId", r"g_rgMarketItemNameId"),
+              ("nameid 任何形式", r"nameid"),
+              ("1999428 类 7 位数字", r"\b\d{6,8}\b"),
+              ("ItemOrdersHistogram", r"ItemOrdersHistogram"),
+              ("g_strItemNameId", r"g_strItemNameId"),
           ]
-          for label, url in variants[:2]:
-              st, raw, dt = fetch(url, HDR)
-              print("  %-26s HTTP %-4s %5.1fs %r" % (label, st, dt, raw[:100]))
-              time.sleep(2)
+          for label, pat in pats:
+              hits = re.findall(pat, text)
+              print("  %-24s %d 次  %s" %
+                    (label, len(hits), str(hits[:5]) if hits else ""))
           print("")
 
-          # ---- B. 生产链路：物品页 → nameid → histogram ----
-          print("=== B. 生产链路逐件验证 ===")
-          print("  %-30s %8s %8s %6s %6s %7s %7s" %
-                ("物品", "nameid", "hist", "buy", "卖", "承接", "秒"))
-          nameids, ok_hist = {}, 0
-          for name in ITEMS:
-              t_item = time.time()
-              st, raw, _ = fetch(
-                  BASE + f"/market/listings/730/{urllib.parse.quote(name)}",
-                  HTML_HDR)
-              if st != 200:
-                  print("  %-30s 物品页 HTTP %s" % (name, st))
-                  time.sleep(3)
+          # 关键：页面里所有 6~8 位数字带上下文
+          print("=== 6~8 位数字及上下文 ===")
+          seen = set()
+          for m in re.finditer(r"\b(\d{6,8})\b", text):
+              n = m.group(1)
+              if n in seen:
                   continue
-              m = NAMEID_RE.search(raw.decode("utf-8", "replace"))
-              if not m:
-                  print("  %-30s 物品页 200 但没找到 nameid" % name)
-                  time.sleep(3)
-                  continue
-              nid = int(m.group(1))
-              nameids[name] = nid
-
-              hq = urllib.parse.urlencode({
-                  "norender": 1, "country": "CN", "language": "zh",
-                  "currency": 23, "item_nameid": nid})
-              st2, raw2, _ = fetch(BASE + "/market/itemordershistogram/?" + hq,
-                                   HDR)
-              dt = time.time() - t_item
-              if st2 == 200:
-                  try:
-                      j = json.loads(raw2)
-                      # sell_order_graph 是卖单，buy_order_graph 是买单
-                      buy = j.get("highest_buy_order") or 0
-                      sell = j.get("lowest_sell_order") or 0
-                      depth = 0
-                      for row in (j.get("buy_order_graph") or [])[:10]:
-                          if len(row) >= 2:
-                              depth += int(row[1]) if not depth else 0
-                      first_buy_qty = (j.get("buy_order_graph") or [[0, 0]])[0]
-                      ok_hist += 1
-                      print("  %-30s %8d %8s %6d %6d %7s %7.1f" %
-                            (name, nid, "200",
-                             buy, sell,
-                             first_buy_qty[1] if len(first_buy_qty) > 1 else "-",
-                             dt))
-                  except Exception as e:
-                      print("  %-30s %8d %8s 解析失败 %s" %
-                            (name, nid, "200", e))
-              else:
-                  print("  %-30s %8d %8s %s" %
-                        (name, nid, st2, raw2[:80]))
-              time.sleep(3)
-          print("")
-          print("  → nameid 拿到 %d/%d，histogram 成功 %d/%d"
-                % (len(nameids), len(ITEMS), ok_hist, len(ITEMS)))
+              seen.add(n)
+              ctx = text[max(0, m.start() - 60):m.end() + 60]
+              ctx = ctx.replace("\n", " ").replace("\r", " ")
+              print("  %s │ %s" % (n, ctx))
+              if len(seen) >= 12:
+                  break
           print("")
 
-          # ---- C. 吞吐：连续 8 次 histogram（复用已有 nameid） ----
-          if nameids:
-              print("=== C. histogram 连续 8 次（间隔 1.5s，复用 nameid） ===")
-              nid = list(nameids.values())[0]
-              hq = urllib.parse.urlencode({
-                  "norender": 1, "country": "CN", "language": "zh",
-                  "currency": 23, "item_nameid": nid})
-              good = 0
-              for i in range(8):
-                  st, raw, dt = fetch(BASE + "/market/itemordershistogram/?" + hq,
-                                      HDR)
-                  if st == 200:
-                      good += 1
-                  else:
-                      print("  #%d HTTP %s %s" % (i, st, raw[:70]))
-                  time.sleep(1.5)
-              print("  → 成功 %d/8" % good)
-              print("")
+          # 页面里所有 script 的 src / 内联 JSON
+          print("=== 内联 JSON / script 线索 ===")
+          for m in list(re.finditer(r"<script[^>]*>(.{0,300}?)</script>", text, re.S))[:8]:
+              body = m.group(1).strip()
+              if body:
+                  print("  %r" % body[:200])
+          print("")
 
-          # ---- D. priceoverview 数量是否等于剩余挂单 ----
-          print("=== D. histogram 原始结构（第一件） ===")
-          if nameids:
-              nid = list(nameids.values())[0]
-              hq = urllib.parse.urlencode({
-                  "norender": 1, "country": "CN", "language": "zh",
-                  "currency": 23, "item_nameid": nid})
-              st, raw, _ = fetch(BASE + "/market/itemordershistogram/?" + hq, HDR)
-              if st == 200:
-                  j = json.loads(raw)
-                  print("  顶层键: %s" % sorted(j.keys()))
-                  for k in ("highest_buy_order", "lowest_sell_order",
-                            "buy_order_count", "sell_order_count"):
-                      print("  %-20s = %r" % (k, j.get(k)))
-                  print("  buy_order_graph 前 3 档: %r"
-                        % (j.get("buy_order_graph") or [])[:3])
+          print("=== 页面长度分布 / 是否 SPA 骨架 ===")
+          print("  <body 出现: %d" % text.count("<body"))
+          print("  app-root: %d" % text.count('id="app-root"'))
+          print("  window.SSR: %d" % text.count("SSR"))
+          print("  页面后 800 字符:")
+          print("  %r" % text[-800:])
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -208,5 +137,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r3: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r4: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
