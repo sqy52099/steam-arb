@@ -150,11 +150,16 @@ async function load(){
     $('cnt').textContent = `${RAW.length} 件`;
     // 采集每 30 分钟一轮，加上排队延迟，正常不会超过 1 小时。
     // 太久没更新基本等于 pipeline 停了，必须让人一眼看出来，别拿旧价当现价。
-    const stale = ageMin > 90
-      ? `⚠ 数据已经 ${fmtAge(ageMin)}没更新了，下面的价格很可能已失效，别照着下单。`
-      : '';
-    $('disc').textContent = (stale ? stale + ' ' : '') + (j.note || '');
-    if (stale) $('disc').classList.add('stale');
+    const warn = [];
+    if (ageMin > 90)
+      warn.push(`⚠ 数据已经 ${fmtAge(ageMin)}没更新了，下面的价格很可能已失效，别照着下单。`);
+    // 折算比没标定成功时，代码会退回真实汇率算人民币价。汇率比 Steam 国区
+    // 定价高约 6%，方向正好是「让你以为更赚」，所以必须挂在最显眼的地方。
+    const h = j.health || {};
+    if (h.fx && h.fx.ok === false)
+      warn.push('⚠ 折算比没标定成功，人民币价是按真实汇率算的，比 Steam 国区实际定价高约 6% —— 真实收益会比这里低。');
+    $('disc').textContent = (warn.length ? warn.join(' ') + ' ' : '') + (j.note || '');
+    if (warn.length) $('disc').classList.add('stale');
   }catch(e){
     $('stamp').textContent = '数据加载失败：' + e.message;
     $('disc').textContent = '找不到 data/latest.json。本地预览先跑：'

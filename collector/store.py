@@ -139,14 +139,29 @@ QUOTE_COLS = (
 
 
 def upsert_quotes(con, rows: list[dict], appid: int = 730) -> int:
-    """每件只留最新一条。first_ts 保留最早那次观测，不被覆盖。"""
+    """每件只留最新一条。first_ts 保留最早那次观测，不被覆盖。
+
+    同一轮里一件物品可能被采到两次（4 个 shard 的切片是按名字排序切的，
+    正常不会重叠，但 artifact 重跑、手工补采都可能撞上）。后写的那条
+    未必更好 —— 有一回就是同一件被采到两次，高价那条盖掉低价那条，
+    页面上的求购价凭空高了 3 倍。所以：**谁观测得更晚谁说了算**，
+    同一时刻再按求购价高的留下。轮内去重已经在 run_merge 里做过一次，
+    这里只兜底跨轮的情况。
+    """
     n = 0
     ph = ",".join("?" * (len(QUOTE_COLS) + 2))
     sets = ",".join(f"{c}=excluded.{c}" for c in QUOTE_COLS if c != "first_ts")
+    # 只有当新数据不旧于旧数据时才覆盖。用 ts 而不是价格排序，是因为按
+    # 价格留高会让「行情真的跌了」永远写不进去，页面一直挂着旧高价 ——
+    # 那比重复覆盖更危险。
+    guard = (" WHERE excluded.ts > quotes.ts"
+             " OR (excluded.ts = quotes.ts"
+             "     AND COALESCE(excluded.bid_cny,0) >= COALESCE(quotes.bid_cny,0))")
     sql = (f"INSERT INTO quotes(appid,hash_name,{','.join(QUOTE_COLS)}) "
            f"VALUES({ph}) "
            f"ON CONFLICT(appid,hash_name) DO UPDATE SET {sets},"
-           f" first_ts=COALESCE(quotes.first_ts, excluded.first_ts)")
+           f" first_ts=COALESCE(quotes.first_ts, excluded.first_ts)"
+           + guard)
     now = int(time.time())
     for r in rows:
         hn = r.get("hash_name") or r.get("name") or r.get("n")

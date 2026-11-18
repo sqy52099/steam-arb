@@ -168,7 +168,7 @@ def t_factor():
     real = steam.price_overview
     table = {"A": (1.19, 7.95), "B": (2.88, 19.28), "C": (0.10, 0.67)}
 
-    def fake(hn, currency=steam.CURRENCY_CNY, appid=steam.APPID):
+    def fake(hn, currency=steam.CURRENCY_CNY, appid=steam.APPID, retries=1):
         if hn not in table:
             return None
         usd, cny = table[hn]
@@ -184,6 +184,25 @@ def t_factor():
         check("低价物品被剔除，不进样本", r["n"] == 2, f"n={r['n']}")
         r2 = steam.market_factor(["missing"])
         check("没样本时返回 None 而不是瞎猜", r2["factor"] is None)
+    finally:
+        steam.price_overview = real
+
+    # 全拿不到时必须早早放弃，不能把合并 job 拖到十几分钟（真事故）
+    calls = []
+
+    def dead(hn, currency=steam.CURRENCY_CNY, appid=steam.APPID, retries=1):
+        calls.append(hn)
+        return None
+
+    steam.price_overview = dead
+    try:
+        t0 = time.monotonic()
+        r3 = steam.market_factor(["A", "B", "C", "D", "E", "F"], max_seconds=90)
+        cost = time.monotonic() - t0
+        check("全拿不到时返回 None", r3["factor"] is None)
+        check("连续空手 3 次就收工，不把 6 个样本全试完",
+              len(calls) == 3, f"实际试了 {len(calls)} 次")
+        check("早退不需要等满超时", cost < 5, f"耗时 {cost:.1f}s")
     finally:
         steam.price_overview = real
 
@@ -224,6 +243,22 @@ def t_store():
         "net_cny": 1.0, "src_buy_cny": 1.0, "ratio": 1.0}])
     n = store.purge_old(con, keep_days=7)
     check("清理久未更新的物品", n == 1 and store.stats(con)["quotes"] == 1, f"清了 {n}")
+
+    # 晚到的旧数据不许盖掉新数据。反过来的取舍（「留高价」）会让行情真的
+    # 跌了也写不进去，页面一直挂着旧高价，比重复覆盖危险得多。
+    store.upsert_quotes(con, [{
+        "hash_name": "A", "ts": now - 900, "bid_cny": 99.0, "net_cny": 85.0,
+        "src_buy_cny": 7.0, "ratio": 12.1}])
+    row = con.execute("SELECT * FROM quotes WHERE hash_name='A'").fetchone()
+    check("迟到的旧数据不覆盖新快照", abs(row["ratio"] - 1.36) < 1e-9,
+          str(row["ratio"]))
+    # 时间相同（同一轮里撞上）时，留求购价高的那条
+    store.upsert_quotes(con, [{
+        "hash_name": "A", "ts": now, "bid_cny": 12.0, "net_cny": 11.0,
+        "src_buy_cny": 7.0, "ratio": 1.57}])
+    row = con.execute("SELECT * FROM quotes WHERE hash_name='A'").fetchone()
+    check("同一时刻撞上时留求购价高的", abs(row["ratio"] - 1.57) < 1e-9,
+          str(row["ratio"]))
 
     got = store.latest_quotes(con, within_hours=48, limit=10)
     check("最新报价按面值比降序", [r["hash_name"] for r in got] == ["A"], str(got))
@@ -480,6 +515,73 @@ def t_merge_real():
         run.DATA = old_data
 
 
+def t_sanity():
+    """合并阶段的盘口可信度过滤。
+
+    这条是照着实测的脏数据写的：★ Talon Knife | Safari Mesh (Factory New)
+    挂单只剩 1 件，物品页报的最低价是 $13.92，而 Waxpeer 自报中间价 $3.33，
+    差 4 倍。不过滤的话页面上会出现 ratio 3.0 的「无风险机会」——
+    真去下单只会亏，这比少几条严重得多。
+    """
+    print("\n盘口可信度过滤")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbsanity_")
+    old_data = run.DATA
+    run.DATA = tmp
+    shards = os.path.join(tmp, "shards")
+    os.makedirs(shards)
+
+    now = int(time.time())
+    # usd_sell 单位是美元分；mid 是第三方自报的 Steam 中间价（人民币）
+    rows = [
+        # 正常：挂单多、价格和参考价吻合
+        {"n": "Good Skin", "usd_bid": 1000, "usd_sell": 1100, "buy": 10.0,
+         "src": "waxpeer", "qty": 5, "depth": 3, "blevels": 2,
+         "buys": 500, "sells": 200, "mid": 74.8, "ts": now},
+        # 挂单只有 1 件 → 最低挂单价不可信
+        {"n": "Thin Book", "usd_bid": 1000, "usd_sell": 1392, "buy": 10.0,
+         "src": "waxpeer", "qty": 1, "depth": 3, "blevels": 2,
+         "buys": 500, "sells": 1, "mid": 33.3, "ts": now},
+        # 挂单不少但价格离谱 4 倍 → 只有参考价能拦住它
+        {"n": "Insane Price", "usd_bid": 1000, "usd_sell": 1392, "buy": 10.0,
+         "src": "waxpeer", "qty": 1, "depth": 3, "blevels": 2,
+         "buys": 500, "sells": 500, "mid": 33.3, "ts": now},
+    ]
+    with open(os.path.join(shards, "shard-00.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"shard": 0, "shards": 1, "round": 9, "ts": now,
+                   "tried": len(rows), "err": "",
+                   "health": {"steam_orders": {"ok": True, "detail": "3/3"}},
+                   "items": rows}, f, ensure_ascii=False)
+
+    real_factor = steam.market_factor
+    steam.market_factor = lambda items, **kw: {
+        "factor": 6.80, "n": len(items), "spread": 0.01, "detail": []}
+    try:
+        args = argparse.Namespace(
+            mode="merge", db=os.path.join(tmp, "s.db"), shard=0, shards=1,
+            batch=3, give_up=25, out_dir=shards, in_dir=shards,
+            fx_samples=3, export_limit=50, within_hours=48, deadline=0)
+        run.run_merge(args)
+        fp = os.path.join(tmp, "latest.json")
+        with open(fp, encoding="utf-8") as f:
+            d = json.load(f)
+        names = sorted(it["n"] for it in d["items"])
+        check("挂单太少的被丢掉", "Thin Book" not in names, str(names))
+        check("偏离第三方参考价太多的被丢掉",
+              "Insane Price" not in names, str(names))
+        check("干净的那件留下", names == ["Good Skin"], str(names))
+        m = d["health"].get("merge") or {}
+        note = str(m.get("detail") or "")
+        check("Summary 里说清丢了几件、为什么",
+              "挂单太少" in note and "偏离参考价" in note, note)
+    finally:
+        steam.market_factor = real_factor
+        run.DATA = old_data
+
+
 def main():
     t_fees()
     t_price()
@@ -489,6 +591,7 @@ def main():
     t_migrate()
     t_merge()
     t_merge_real()
+    t_sanity()
     t_shards()
     t_deadline()
     t_fake()

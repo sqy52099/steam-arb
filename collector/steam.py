@@ -164,8 +164,8 @@ def _fetch(url: str, headers: dict, timeout: int = 45,
     return 0, str(last or "请求失败").encode()
 
 
-def _json(url: str, timeout: int = 30) -> dict:
-    st, raw = _fetch(url, JSON_HEADERS, timeout=timeout)
+def _json(url: str, timeout: int = 30, retries: int = 2) -> dict:
+    st, raw = _fetch(url, JSON_HEADERS, timeout=timeout, retries=retries)
     if st != 200:
         raise Challenge(f"HTTP {st}：{raw[:120]!r}")
     head = raw[:400].lstrip()
@@ -226,14 +226,14 @@ def _parse_price(s) -> float | None:
 # ---------------- 1. 价格概览（轻，用于标定折算比） ----------------
 
 def price_overview(hash_name: str, currency: int = CURRENCY_CNY,
-                   appid: int = APPID) -> dict | None:
+                   appid: int = APPID, retries: int = 1) -> dict | None:
     """最低挂单价 / 中间价 / 24h 成交量。currency 决定返回哪种货币的报价。"""
     q = urllib.parse.urlencode({
         "appid": appid, "currency": currency,
         "market_hash_name": hash_name,
     })
     try:
-        j = _json(f"{BASE}/market/priceoverview/?{q}")
+        j = _json(f"{BASE}/market/priceoverview/?{q}", retries=retries)
     except Challenge:
         return None
     if not j.get("success"):
@@ -245,7 +245,8 @@ def price_overview(hash_name: str, currency: int = CURRENCY_CNY,
     }
 
 
-def market_factor(items: list[str], min_usd: float = 0.5) -> dict:
+def market_factor(items: list[str], min_usd: float = 0.5,
+                  max_seconds: float = 90.0) -> dict:
     """算出「Steam 国区人民币价 ÷ 美元价」的市场折算比。
 
     为什么不能直接用汇率：Steam 的国区定价比真实汇率低几个点，而且各物品
@@ -256,16 +257,35 @@ def market_factor(items: list[str], min_usd: float = 0.5) -> dict:
     做法：取一篮高流动性物品，同一时刻问两种货币的报价，取比值的中位数。
     用 median_price（中间价）优先，它比最低价稳；低价物品先剔掉，
     因为一分钱的舍入在 $0.10 上有 10% 的误差。
+
+    **必须有时间上限。** 第一版没设，6 个样本 12 次请求，全撞 429 时每次
+    退避到 45 秒还要重试两轮，合并 job 在这上面烧了 11 分钟才放弃，最后
+    仍退回汇率。现在：每次请求只重试 1 次，连续空手 3 次就认输，总耗时
+    到 max_seconds 也立刻收工 —— 拿不到就早点说拿不到，别拖着。
     """
+    t0 = time.monotonic()
     pairs = []
     detail = []
+    misses = 0
     for hn in items:
-        usd = price_overview(hn, CURRENCY_USD)
+        if time.monotonic() - t0 > max_seconds:
+            detail.append({"n": hn, "skip": "超时"})
+            break
+        usd = price_overview(hn, CURRENCY_USD, retries=1)
         if not usd:
+            misses += 1
+            detail.append({"n": hn, "fail": "USD 报价拿不到"})
+            if misses >= 3:
+                break
             continue
-        cny = price_overview(hn, CURRENCY_CNY)
+        cny = price_overview(hn, CURRENCY_CNY, retries=1)
         if not cny:
+            misses += 1
+            detail.append({"n": hn, "fail": "人民币报价拿不到"})
+            if misses >= 3:
+                break
             continue
+        misses = 0
         u = usd.get("median") or usd.get("lowest")
         c = cny.get("median") or cny.get("lowest")
         if not u or not c or u < min_usd:

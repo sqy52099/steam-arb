@@ -45,6 +45,10 @@ APPID = 730
 # 算出同一个窗口，否则会重复采同一批物品、漏掉另一批。
 ROUND_SECONDS = 1800
 
+# 盘口可信度门槛（合并阶段用）。见 run_merge 里的注释说明为什么需要这两个。
+MIN_SELLS = 10      # 挂单少于这么多件，最低挂单价不代表市场
+MAX_DEV = 0.40      # 与第三方自报中间价偏离超过 40% 就判为不可信
+
 # 本轮采集的硬截止时间点（monotonic）。CI 上超时会被硬杀，那时一步都没
 # 提交，整轮白跑；所以宁可少采一点也要自己先收工，把拿到的写出去。
 _DEADLINE = None
@@ -193,6 +197,10 @@ def run_collect(args) -> None:
             "n": hn,
             "usd_bid": ob["usd_bid"], "usd_sell": ob["usd_sell"],
             "buy": c["buy_cny"], "src": c["src"], "qty": c.get("src_qty") or 0,
+            # 第三方自报的 Steam 中间价（人民币）。合并阶段用它做合理性校验：
+            # 物品页的最低挂单价在「挂单只剩一两件」时会离谱得离谱，得有个
+            # 独立来源对一下才知道那个盘口能不能信。
+            "mid": c.get("steam_mid_cny"),
             "depth": ob["bid_depth"], "blevels": ob["bid_levels"],
             "buys": ob["buy_orders"], "sells": ob["sell_orders"],
             "ts": int(time.time()),
@@ -284,6 +292,7 @@ def run_merge(args) -> None:
     rows = []
     now = int(time.time())
     skipped = 0
+    dropped = {"没卖单": 0, "偏离参考价": 0}
     for it in items:
         ub, us = it.get("usd_bid"), it.get("usd_sell")
         if not ub:
@@ -291,6 +300,23 @@ def run_merge(args) -> None:
             continue
         bid_cny = round(ub / 100.0 * fx, 2)
         sell_cny = round(us / 100.0 * fx, 2) if us else None
+
+        # ---- 盘口可信度 ------------------------------------------------
+        # 最低挂单价只在「有足够多人挂着」时才代表市场价。实测反面例子：
+        #   ★ Talon Knife | Safari Mesh (Factory New) 挂单只剩 1 件，
+        #   amtMinSellOrder 报到 $13.92，而 Waxpeer 自报中间价 $3.33，
+        #   差 4 倍 —— 那条 ratio 3.03 的「机会」就是这么来的。
+        # 所以：挂单少于 MIN_SELLS 件就丢；有第三方参考价时，偏离超过
+        # MAX_DEV 也丢。宁可少几条，也不能给出会让人真去下单的假数字。
+        sells = it.get("sells")
+        if sells is not None and sells < MIN_SELLS:
+            dropped["没卖单"] += 1
+            continue
+        mid = it.get("mid")
+        if mid and sell_cny and abs(sell_cny - mid) / mid > MAX_DEV:
+            dropped["偏离参考价"] += 1
+            continue
+
         buy = it.get("buy")
         net = fees.net_from_buyer(bid_cny)              # 挂求购价，立刻成交
         net_sell = fees.net_from_buyer(sell_cny) if sell_cny else None
@@ -309,12 +335,34 @@ def run_merge(args) -> None:
                           if (buy and net_sell) else None,
         })
 
+    # 同一件在本轮里可能被多个 shard 各采到一次（切片按名字排序切，正常
+    # 不重叠，但 artifact 重跑或手工补采会撞上）。只留求购价最高的那条：
+    # 盘口本身会抖几个点，可一旦撞上「同页抓错对象」那种脏数据，差值会是
+    # 几倍。留低的会把真正能赚的漏掉，所以留高的——脏数据要靠上面那道
+    # 盘口可信度门槛挡，不能靠这里猜。
+    best: dict[str, dict] = {}
+    for r in rows:
+        k = r["hash_name"]
+        cur = best.get(k)
+        if cur is None or (r.get("usd_bid") or 0) > (cur.get("usd_bid") or 0):
+            best[k] = r
+    if len(best) != len(rows):
+        log(f"本轮有 {len(rows) - len(best)} 条重复物品，按求购价取优后剩 {len(best)} 条")
+        rows = list(best.values())
+
     n = upsert_quotes(con, rows)
     upsert_items(con, [{"hash_name": it["n"]} for it in items])
-    mark("merge", True,
-         f"{n} 条入库 / {len(items)} 件采到 / round {rnd}"
-         + (f" / {skipped} 件无求购价跳过" if skipped else ""))
+    note = (f"{n} 条入库 / {len(items)} 件采到 / round {rnd}"
+            + (f" / {skipped} 件无求购价跳过" if skipped else "")
+            + (f" / 丢掉 {dropped['没卖单']} 件挂单太少"
+               if dropped["没卖单"] else "")
+            + (f" / 丢掉 {dropped['偏离参考价']} 件偏离参考价"
+               if dropped["偏离参考价"] else ""))
+    mark("merge", True, note)
     log(f"入库 {n} 条（{skipped} 件没有求购价，跳过）")
+    if dropped["没卖单"] or dropped["偏离参考价"]:
+        log(f"丢掉不可信盘口：挂单太少 {dropped['没卖单']} 件、"
+            f"偏离参考价 {dropped['偏离参考价']} 件")
 
     gone = purge_old(con, 7)
     if gone:
