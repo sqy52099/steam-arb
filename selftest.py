@@ -10,6 +10,7 @@
   手续费阶梯、价格解析、盘口抠取、折算比标定、分片切分、快照覆盖、老库迁移。
 这些地方错一位不会报错，只会让页面上的比例悄悄失真。
 """
+import io
 import json
 import os
 import sqlite3
@@ -807,6 +808,38 @@ def t_net_give_up():
         run.fetch_candidates = real_cand
 
 
+def t_fetch_code():
+    """重试用完之后要把最后那个状态码交出去。
+
+    429 用完重试还是 429（还在被限流，该继续等），返成 0 就成了「连不上」
+    （该快速收工）。线上因此出现过一整轮被判成连不上、5 次就收工。
+    """
+    print("\n重试耗尽后的状态码")
+    import urllib.error
+
+    real = steam.urllib.request.urlopen
+
+    def http429(req, timeout=0):
+        raise urllib.error.HTTPError(req.full_url, 429, "Too Many Requests",
+                                     {}, io.BytesIO(b""))
+
+    def netfail(req, timeout=0):
+        raise TimeoutError("timed out")
+
+    steam.LIMITER.on_429 = lambda: None      # 别真睡
+    try:
+        steam.urllib.request.urlopen = http429
+        code, _ = steam._fetch("https://x/", {}, retries=1)
+        check("429 用完重试还是 429，不是 0", code == 429, str(code))
+
+        steam.urllib.request.urlopen = netfail
+        code, body = steam._fetch("https://x/", {}, retries=0)
+        check("真连不上才是 0", code == 0, str(code))
+        check("连不上要带上原因", b"timed out" in body, body[:60].decode())
+    finally:
+        steam.urllib.request.urlopen = real
+
+
 def main():
     t_fees()
     t_price()
@@ -819,6 +852,7 @@ def main():
     t_sanity()
     t_shard_fx()
     t_net_give_up()
+    t_fetch_code()
     t_fx_reuse()
     t_shards()
     t_deadline()

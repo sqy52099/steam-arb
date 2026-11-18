@@ -148,8 +148,15 @@ JSON_HEADERS = {
 
 def _fetch(url: str, headers: dict, timeout: int = 45,
            retries: int = 2) -> tuple[int, bytes]:
-    """返回 (状态码, 内容)。429 在这里消化掉，不往上抛。"""
+    """返回 (状态码, 内容)。429 在这里消化掉，不往上抛。
+
+    重试用完之后必须**把最后那个 HTTP 状态码交出去**，不能一律返回 0：
+    0 的含义是「连不上」，上层会据此快速收工；而 429 用完重试是「还在被
+    限流」，该继续等恢复窗口。早期版本两者都返 0，线上出现过一整轮被当成
+    连不上、5 次就收工的情况。
+    """
     last = None
+    last_code = 0
     for i in range(retries + 1):
         LIMITER.wait()
         req = urllib.request.Request(url, headers=headers)
@@ -167,21 +174,24 @@ def _fetch(url: str, headers: dict, timeout: int = 45,
             if e.code == 429:
                 LIMITER.on_429()
                 last = e
+                last_code = 429
                 continue
             if e.code in (502, 503, 504):
                 last = e
+                last_code = e.code
                 LIMITER.on_429()
                 continue
             # 404 之类是真实结果，交给调用方判断
             return e.code, e.read()[:400]
         except Exception as e:          # 网络抖动 / 超时
             last = e
+            last_code = 0
             # 连着失败说明这台机器现在根本连不上，多睡没意义；第一次
             # 抖动给一次重试机会，之后就快速把 (0, 原因) 交出去，让上层
             # 按 RateLimited 计数收工，别把 12 分钟耗在等超时上。
             if i == 0 and retries > 0:
                 time.sleep(2)
-    return 0, str(last or "请求失败").encode()
+    return last_code, str(last or "请求失败").encode()
 
 
 def _json(url: str, timeout: int = 30, retries: int = 2) -> dict:
