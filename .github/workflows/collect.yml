@@ -14,6 +14,15 @@ on:
     # 间隔比耗时短的话队列会越堆越多，最后全是排队等超时的废跑。
     - cron: "*/30 * * * *"
   workflow_dispatch:        # 允许手动点一次，方便第一次验证
+  push:
+    branches: [main]
+    # 只在动到采集/前端时才跑：改了代码就等于顺手验一次，
+    # 纯文档提交不会白烧一轮 runner。
+    paths:
+      - "collector/**"
+      - "web/**"
+      - "build_site.py"
+      - ".github/workflows/collect.yml"
 
 permissions:
   contents: write
@@ -164,6 +173,10 @@ jobs:
         run: python build_site.py
 
       - uses: actions/configure-pages@v5
+        with:
+          # 第一次跑时仓库里 Pages 还没开，这里直接调 API 打开，
+          # 省掉「先去 Settings 点一下」那步。开了之后它就是空操作。
+          enablement: true
 
       - uses: actions/upload-pages-artifact@v3
         with:
