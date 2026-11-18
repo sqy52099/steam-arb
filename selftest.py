@@ -215,7 +215,9 @@ def t_store():
     con = store.connect(os.path.join(tmp, "t.db"))
     check("建表", con.execute(
         "SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0] >= 3)
-    check("schema 版本写进 meta", store.meta_get(con, "schema_version") == "2")
+    check("schema 版本写进 meta",
+          store.meta_get(con, "schema_version") == store.SCHEMA_VERSION,
+          str(store.meta_get(con, "schema_version")))
 
     store.upsert_items(con, [{"hash_name": "A"}, {"hash_name": "B"}])
     store.upsert_items(con, [{"hash_name": "A"}])
@@ -577,6 +579,24 @@ def t_sanity():
         note = str(m.get("detail") or "")
         check("Summary 里说清丢了几件、为什么",
               "挂单太少" in note and "偏离参考价" in note, note)
+
+        # 关键：往轮留下的脏行也要在导出时挡掉。一轮只采几十件，表里
+        # 五千多件都是往轮的，只靠写入端过滤，旧脏行会一直挂在页面上。
+        con = store.connect(args.db)
+        store.upsert_quotes(con, [{
+            "hash_name": "Old Junk", "ts": now - 3000,
+            "first_ts": now - 3000,
+            "sell_cny": 139.2, "bid_cny": 100.0, "net_cny": 87.0,
+            "net_sell_cny": 121.0, "src_buy_cny": 10.0, "src_name": "x",
+            "sell_orders": 1, "src_mid_cny": 33.3,
+            "ratio": 8.7, "ratio_sell": 12.1}])
+        con.close()
+        run.export(args, store.connect(args.db))
+        with open(fp, encoding="utf-8") as f:
+            d2 = json.load(f)
+        names2 = [it["n"] for it in d2["items"]]
+        check("导出时挡掉往轮留下的脏盘口（ratio 再高也不放）",
+              "Old Junk" not in names2, str(names2))
     finally:
         steam.market_factor = real_factor
         run.DATA = old_data

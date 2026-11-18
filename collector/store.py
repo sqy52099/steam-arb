@@ -25,7 +25,7 @@ KEEP_DAYS = 7
 
 # 表结构改过一次：v1 是 (ts,...) 主键攒历史，v2 是 (appid,hash_name) 主键存快照。
 # 版本号写进 meta，对不上就整表重建（这库本来就是可再生的缓存）。
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS quotes (
     src_qty      INTEGER,            -- 第三方库存量
     ratio        REAL,               -- net_cny / src_buy_cny
     ratio_sell   REAL,               -- net_sell_cny / src_buy_cny
+    src_mid_cny  REAL,               -- 第三方自报的 Steam 中间价（校验用）
     PRIMARY KEY (appid, hash_name)
 );
 CREATE INDEX IF NOT EXISTS idx_quotes_ratio ON quotes(appid, ratio DESC);
@@ -81,14 +82,19 @@ def connect(path: str | None = None) -> sqlite3.Connection:
 
 
 def _migrate(con: sqlite3.Connection) -> None:
-    """老库（v1 攒历史那版）直接重建 quotes —— 里面的历史数据本来就是
-    每轮重新采的行情，丢了下一轮就补回来，不值得写迁移脚本。"""
+    """老库直接重建 quotes —— 里面的数据本来就是每轮重新采的行情，
+    丢了下一轮就补回来，不值得写迁移脚本。
+
+    判据是「缺列」而不是版本号：加一列就重建一次，比维护迁移链简单，
+    而且这些数据全都能重新采回来，没有任何不可再生的东西。
+    """
+    needed = {"first_ts", "src_mid_cny"}
     exists = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='quotes'"
     ).fetchone()
     if exists:
         cols = {r["name"] for r in con.execute("PRAGMA table_info(quotes)")}
-        if "first_ts" not in cols:
+        if needed - cols:
             con.execute("DROP TABLE quotes")
             con.commit()
     con.executescript(SCHEMA)
@@ -134,7 +140,7 @@ QUOTE_COLS = (
     "ts", "first_ts", "sell_cny", "bid_cny", "net_cny", "net_sell_cny",
     "usd_bid", "usd_sell", "fx", "bid_depth", "bid_levels",
     "sell_orders", "buy_orders", "src_buy_cny", "src_name", "src_qty",
-    "ratio", "ratio_sell",
+    "ratio", "ratio_sell", "src_mid_cny",
 )
 
 

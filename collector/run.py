@@ -260,6 +260,25 @@ def load_shards(in_dir: str) -> tuple[list[dict], dict, int]:
     return items, health, rnd
 
 
+def book_trusted(sell_cny, mid, sells) -> str:
+    """盘口能不能信。返回 ""（可信）或丢弃理由。
+
+    最低挂单价只在「有足够多人挂着」时才代表市场价。实测反面例子：
+      ★ Talon Knife | Safari Mesh (Factory New) 挂单只剩 1 件，
+      amtMinSellOrder 报到 $13.92，而 Waxpeer 自报中间价 $3.33，差 4 倍
+      —— 第一轮真跑里 ratio 3.03 那条「机会」就是这么来的。
+
+    这个判断必须**写入和读取都做一遍**：每轮只采几十件，表里五千多件都
+    是往轮留下的，只在写入时过滤的话，上一轮的脏行还会从 latest_quotes
+    里被导出来，页面上照样挂着假机会。
+    """
+    if sells is not None and sells < MIN_SELLS:
+        return "没卖单"
+    if mid and sell_cny and abs(sell_cny - mid) / mid > MAX_DEV:
+        return "偏离参考价"
+    return ""
+
+
 def run_merge(args) -> None:
     """把 shard 结果折成人民币、算面值比、写库、导出。"""
     items, health, rnd = load_shards(args.in_dir)
@@ -301,20 +320,9 @@ def run_merge(args) -> None:
         bid_cny = round(ub / 100.0 * fx, 2)
         sell_cny = round(us / 100.0 * fx, 2) if us else None
 
-        # ---- 盘口可信度 ------------------------------------------------
-        # 最低挂单价只在「有足够多人挂着」时才代表市场价。实测反面例子：
-        #   ★ Talon Knife | Safari Mesh (Factory New) 挂单只剩 1 件，
-        #   amtMinSellOrder 报到 $13.92，而 Waxpeer 自报中间价 $3.33，
-        #   差 4 倍 —— 那条 ratio 3.03 的「机会」就是这么来的。
-        # 所以：挂单少于 MIN_SELLS 件就丢；有第三方参考价时，偏离超过
-        # MAX_DEV 也丢。宁可少几条，也不能给出会让人真去下单的假数字。
-        sells = it.get("sells")
-        if sells is not None and sells < MIN_SELLS:
-            dropped["没卖单"] += 1
-            continue
-        mid = it.get("mid")
-        if mid and sell_cny and abs(sell_cny - mid) / mid > MAX_DEV:
-            dropped["偏离参考价"] += 1
+        why = book_trusted(sell_cny, it.get("mid"), it.get("sells"))
+        if why:
+            dropped[why] += 1
             continue
 
         buy = it.get("buy")
@@ -333,6 +341,7 @@ def run_merge(args) -> None:
             "ratio": round(net / buy, 4) if buy else None,
             "ratio_sell": round(net_sell / buy, 4)
                           if (buy and net_sell) else None,
+            "src_mid_cny": it.get("mid"),      # 导出时还要用它复筛一遍
         })
 
     # 同一件在本轮里可能被多个 shard 各采到一次（切片按名字排序切，正常
@@ -377,6 +386,21 @@ def export(args, con) -> None:
     """给前端用的静态 JSON：只放排序后的前 N 条，控制体积。"""
     rows = latest_quotes(con, appid=APPID, within_hours=args.within_hours,
                          limit=args.export_limit)
+
+    # 读取时再过滤一遍盘口。写入端已经挡过一次，但表里绝大多数行是往轮
+    # 留下的（一轮只采几十件，候选池五千多），它们从来没经过现在的门槛。
+    # 只靠写入端筛，上一轮的脏行会照着旧数一直挂在页面上。
+    keep = []
+    stale_bad = 0
+    for r in rows:
+        if book_trusted(r.get("sell_cny"), r.get("src_mid_cny"),
+                        r.get("sell_orders")):
+            stale_bad += 1
+            continue
+        keep.append(r)
+    if stale_bad:
+        log(f"导出时又挡掉 {stale_bad} 条往轮留下的不可信盘口")
+    rows = keep
     fx = None
     try:
         fx = float(meta_get(con, "fx"))
