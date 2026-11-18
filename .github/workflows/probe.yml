@@ -1,6 +1,7 @@
 name: probe
 
-# 一次性诊断：确认 Auzre runner 的出口能不能访问 Steam 社区市场。
+# 一次性诊断：确认 Azure runner 的出口能不能访问 Steam 社区市场。
+# 结果写进 probe-log 分支（API 读不到 job 日志，只能走仓库）。
 # 用完即删，不要留在仓库里。
 on:
   workflow_dispatch:
@@ -10,7 +11,10 @@ on:
       - ".github/workflows/probe.yml"
 
 permissions:
-  contents: read
+  contents: write
+
+env:
+  OUT_DIR: /tmp/probelog
 
 jobs:
   probe:
@@ -19,9 +23,11 @@ jobs:
     steps:
       - name: 探针
         run: |
-          {
-          python - <<'PY'
-          import http.cookiejar, re, time, urllib.error, urllib.parse, urllib.request
+          set -e
+          mkdir -p "$OUT_DIR"
+          python - <<'PY' > "$OUT_DIR/probe.txt" 2>&1
+          import http.cookiejar, json, re, time
+          import urllib.error, urllib.parse, urllib.request
 
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -43,32 +49,38 @@ jobs:
               try:
                   with op.open(req, timeout=timeout) as r:
                       raw = r.read()
-                      print("**%s** → HTTP %s  %dB  %.1fs"
-                            % (label, r.status, len(raw), time.time() - t0))
-                      print("  `%r`" % raw[:220])
+                      print("%-34s HTTP %s  %dB  %.1fs" %
+                            (label, r.status, len(raw), time.time() - t0))
+                      print("    %r" % raw[:260])
                       return r.status, raw
               except urllib.error.HTTPError as e:
                   body = e.read()[:300]
-                  print("**%s** → HTTP %s  %.1fs  retry-after=%s"
-                        % (label, e.code, time.time() - t0,
-                           e.headers.get("Retry-After")))
-                  print("  `%r`" % body)
+                  print("%-34s HTTP %s  %.1fs  retry-after=%s" %
+                        (label, e.code, time.time() - t0,
+                         e.headers.get("Retry-After")))
+                  print("    %r" % body)
                   return e.code, body
               except Exception as e:
-                  print("**%s** → 异常 %s: %s" % (label, type(e).__name__, e))
+                  print("%-34s 异常 %s: %s" % (label, type(e).__name__, e))
                   return None, b""
 
 
-          print("### 探针结果")
+          print("=== 出口 IP ===")
+          try:
+              with urllib.request.urlopen("https://api.ipify.org", timeout=15) as r:
+                  print(r.read().decode())
+          except Exception as e:
+              print("拿不到:", e)
           print("")
 
-          # 1. 拿 cookie（很多 429 其实是没有会话）
+          # 1. 先取 cookie（很多 429 其实是没有会话）
           jar = http.cookiejar.CookieJar()
           op_jar = urllib.request.build_opener(
               urllib.request.HTTPCookieProcessor(jar))
-          hit("1 打开市场首页（取 cookie）", BASE + "/market/",
+          hit("1 市场首页(取 cookie)", BASE + "/market/",
               {"User-Agent": UA}, op_jar)
-          print("  cookies: %s" % [c.name for c in jar])
+          print("    cookies: %s" % [c.name for c in jar])
+          print("")
 
           q = urllib.parse.urlencode({
               "appid": 730, "norender": 1, "count": 10, "start": 0,
@@ -77,32 +89,27 @@ jobs:
           })
           search = BASE + "/market/search/render/?" + q
 
-          # 2. 带 cookie 打列表
-          hit("2 search/render（带 cookie）", search, JSON_HDR, op_jar)
-
-          # 3. 不带任何自定义头（裸 urllib）
-          hit("3 search/render（无自定义头）", search)
-
-          # 4. 带全套头但不用 cookie
-          hit("4 search/render（全套头、无 cookie）", search, JSON_HDR)
-
+          hit("2 search(带 cookie)", search, JSON_HDR, op_jar)
+          time.sleep(3)
+          hit("3 search(裸 urllib)", search)
+          time.sleep(3)
+          hit("4 search(全套头无 cookie)", search, JSON_HDR)
           time.sleep(3)
 
-          # 5. priceoverview
+          # 5. 换个更轻的接口确认账号级可达性
           pq = urllib.parse.urlencode({
               "appid": 730, "currency": 23, "market_hash_name": ITEM})
-          hit("5 priceoverview " + ITEM,
-              BASE + "/market/priceoverview/?" + pq, JSON_HDR, op_jar)
-
+          hit("5 priceoverview", BASE + "/market/priceoverview/?" + pq,
+              JSON_HDR, op_jar)
           time.sleep(3)
 
           # 6. 物品页拿 nameid
-          st, raw = hit("6 物品页（找 nameid）",
-                        BASE + "/market/listings/730/"
-                        + urllib.parse.quote(ITEM), {"User-Agent": UA}, op_jar)
+          st, raw = hit("6 物品页(找 nameid)",
+                        BASE + "/market/listings/730/" + urllib.parse.quote(ITEM),
+                        {"User-Agent": UA}, op_jar)
           text = raw.decode("utf-8", "replace")
           m = re.search(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)", text)
-          print("  nameid = %s" % (m.group(1) if m else "没找到"))
+          print("    nameid = %s" % (m.group(1) if m else "没找到"))
           if m:
               time.sleep(3)
               hq = urllib.parse.urlencode({
@@ -111,4 +118,19 @@ jobs:
               hit("7 itemordershistogram",
                   BASE + "/market/itemordershistogram/?" + hq, JSON_HDR, op_jar)
           PY
-          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$OUT_DIR/probe.txt"
+
+      - name: 推结果到 probe-log 分支
+        run: |
+          set -e
+          cd "$OUT_DIR"
+          git init -q
+          git config user.name  "arb-bot"
+          git config user.email "arb-bot@users.noreply.github.com"
+          git remote add origin \
+            "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git checkout -q -b probe-log
+          cp probe.txt probe.txt.bak
+          git add probe.txt
+          git commit -q -m "probe: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q -f origin probe-log
