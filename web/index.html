@@ -69,8 +69,9 @@ td.name a:hover{color:var(--acc)}
   <div class="filters">
     <div class="f"><label>面值比 ≥</label>
       <input type="number" id="fRatio" step="0.01" value="1.00"></div>
-    <div class="f"><label>成交量 ≥</label>
-      <input type="number" id="fVol" step="10" value="30"></div>
+    <div class="f"><label>买盘深度 ≥</label>
+      <input type="number" id="fDepth" step="10" value="1"
+        title="求购前 10 档能承接多少件。太浅的话你的货卖不掉"></div>
     <div class="f"><label>买入价 ¥≥</label>
       <input type="number" id="fMin" step="1" value="3"></div>
     <div class="f"><label>买入价 ¥≤</label>
@@ -87,24 +88,27 @@ td.name a:hover{color:var(--acc)}
   <table>
     <thead><tr>
       <th class="name" data-k="n">物品</th>
-      <th data-k="ratio">面值比</th>
+      <th data-k="ratio">面值比<br><span style="font-weight:400">求购价</span></th>
+      <th data-k="ratio_sell">面值比<br><span style="font-weight:400">挂单价</span></th>
       <th data-k="real">折现净额</th>
       <th data-k="buy">买入价</th>
       <th data-k="net">Steam 净得</th>
       <th data-k="bid" class="hide-s">求购价</th>
       <th data-k="sell" class="hide-s">最低挂单</th>
-      <th data-k="vol">24h 成交</th>
-      <th class="hide-s">来源</th>
+      <th data-k="depth" class="hide-s">买盘深度</th>
+      <th data-k="qty" class="hide-s">第三方库存</th>
     </tr></thead>
     <tbody id="tb"></tbody>
   </table>
   <div class="empty" id="empty" style="display:none">没有符合条件的物品，把筛选放宽一点。</div>
 
   <div class="legend">
-    <b>面值比</b> = Steam 上卖掉后<span class="good">卖家净得</span> ÷ 第三方买入价（已按 Steam 阶梯手续费精确扣减）。<br>
+    <b>面值比</b> = Steam 上卖掉后<span class="good">卖家净得</span> ÷ 第三方买入价（已按 Steam 阶梯手续费精确扣减）。
+    两列分别是<b>直接挂求购价秒卖</b>和<b>自己挂最低价排队</b>的结果，前者成交快、后者价高。<br>
+    <b>买盘深度</b> = 求购前 10 档能承接的件数。看着有价但深度只有几件，你的货就卖不掉。<br>
     <b>折现净额</b> = Steam 净得 × 折现系数 − 买入价。余额不能直接变成现金，一般只能按 0.75~0.85 用掉，
     所以面值比 &gt; 1 也可能是亏的。<br>
-    数据来自 Steam 社区市场公开接口与第三方站点，<b>有 5～15 分钟延迟</b>，
+    数据来自 Steam 社区市场公开页面与第三方站点，<b>有 5～15 分钟延迟</b>，
     下单前请点物品名去官方页面核对实时价格。
   </div>
 </div>
@@ -117,10 +121,10 @@ const $ = id => document.getElementById(id);
 
 function fmtAge(min){
   if (min < 1) return '刚刚';
-  if (min < 60) return min + ' 分钟';
+  if (min < 60) return min + ' 分钟前';
   const h = Math.floor(min / 60);
-  if (h < 24) return h + ' 小时';
-  return Math.floor(h / 24) + ' 天';
+  if (h < 24) return h + ' 小时前';
+  return Math.floor(h / 24) + ' 天前';
 }
 const fmt = (v, d=2) => (v===null||v===undefined||!isFinite(v)) ? '—' : v.toFixed(d);
 const el = (t,c,txt) => { const e=document.createElement(t); if(c)e.className=c;
@@ -142,7 +146,7 @@ async function load(){
     const ageMin = Math.round((Date.now()/1000 - j.generated) / 60);
     $('stamp').textContent = '数据时间 ' +
       new Date(j.generated*1000).toLocaleString('zh-CN',{hour12:false}) +
-      '（' + fmtAge(ageMin) + '前）';
+      '（' + fmtAge(ageMin) + '）';
     $('cnt').textContent = `${RAW.length} 件`;
     // 采集每 30 分钟一轮，加上排队延迟，正常不会超过 1 小时。
     // 太久没更新基本等于 pipeline 停了，必须让人一眼看出来，别拿旧价当现价。
@@ -163,14 +167,14 @@ function disc(){ const v = parseFloat($('fDisc').value); return isFinite(v)? v :
 
 function view(){
   const rMin = parseFloat($('fRatio').value) || 0;
-  const vMin = parseFloat($('fVol').value) || 0;
+  const dMin = parseFloat($('fDepth').value) || 0;
   const pMin = parseFloat($('fMin').value) || 0;
   const pMax = parseFloat($('fMax').value) || Infinity;
   const src  = $('fSrc').value;
   const d = disc();
   return RAW
     .filter(it => (it.ratio ?? 0) >= rMin
-               && (it.vol ?? 0) >= vMin
+               && (it.depth ?? 0) >= dMin
                && (it.buy ?? 0) >= pMin && (it.buy ?? 0) <= pMax
                && (!src || it.src === src))
     .map(it => ({...it,
@@ -203,6 +207,14 @@ function render(){
       fmt(it.ratio, 3)); tdR.appendChild(sp);
     tr.appendChild(tdR);
 
+    // 自己挂最低价排队的结果：价更高但要等，和上面那列对照着看
+    const tdRS = el('td', null);
+    if(it.ratio_sell != null){
+      const s2 = el('span', cls(it.ratio_sell), fmt(it.ratio_sell, 3));
+      tdRS.appendChild(s2);
+    } else tdRS.textContent = '—';
+    tr.appendChild(tdRS);
+
     const tdReal = el('td', (it.real ?? 0) >= 0 ? 'good' : 'bad',
       (it.real===null?'—':((it.real>=0?'+':'') + fmt(it.real))));
     tr.appendChild(tdReal);
@@ -211,8 +223,8 @@ function render(){
     tr.appendChild(el('td', null, '¥'+fmt(it.net)));
     tr.appendChild(el('td','hide-s', it.bid ? '¥'+fmt(it.bid) : '—'));
     tr.appendChild(el('td','hide-s', it.sell ? '¥'+fmt(it.sell) : '—'));
-    tr.appendChild(el('td', null, String(it.vol ?? '—')));
-    tr.appendChild(el('td','hide-s', it.src || '—'));
+    tr.appendChild(el('td','hide-s', it.depth != null ? String(it.depth) : '—'));
+    tr.appendChild(el('td','hide-s', it.qty != null ? String(it.qty) : '—'));
     frag.appendChild(tr);
   }
   tb.appendChild(frag);
@@ -226,10 +238,10 @@ document.querySelectorAll('th[data-k]').forEach(th => {
     render();
   });
 });
-['fRatio','fVol','fMin','fMax','fSrc','fDisc'].forEach(id =>
+['fRatio','fDepth','fMin','fMax','fSrc','fDisc'].forEach(id =>
   $(id).addEventListener('input', render));
 $('reset').addEventListener('click', () => {
-  $('fRatio').value = 1.00; $('fVol').value = 30;
+  $('fRatio').value = 1.00; $('fDepth').value = 1;
   $('fMin').value = 3; $('fMax').value = 20000;
   $('fSrc').value = ''; $('fDisc').value = DISC_DEFAULT;
   SORT = {k:'ratio', dir:-1}; render();

@@ -1,20 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-一次采集的编排：第三方买入价 + Steam 价格 → 算比例 → 入库 → 导出前端 JSON。
+采集编排。因为 Steam 对机房 IP 按接口区别对待（详见 steam.py 顶部说明），
+一轮采集必须拆成两个阶段、跑在不同 job 里：
 
-每轮做的事：
-  1. 拉 Skinport / Waxpeer 的第三方买入价（国内可直连）
-  2. 用 Steam 列表接口更新物品字典和成交量
-  3. 从候选池里轮转取 N 件，补 nameid（没有的话）并查求购价
-  4. 用 fees.py 精确算净得、比例，写 quotes
-  5. 清 30 天前的旧数据，导出 data/latest.json
+  collect（N 个 job 并行）
+      每台机器只干一件便宜事：拿第三方候选名单 → 抓物品页 → 把盘口原样
+      写成 shard-<序号>.json。不碰数据库，因为并行 job 之间没有共享状态。
+      每个 job 出口 IP 不同、限流额度独立，这是整条链路唯一的放大器。
 
---fake 用于没有外网时验证整条链路（写合成数据，会标记 fake=1）。
+  merge（1 个 job）
+      读完所有 shard、标定「国区人民币 ÷ 美元」折算比、算净得与面值比、
+      写库、导出前端用的 latest.json。数据库只有它能写。
+
+为什么不在 collect 阶段就算人民币：盘口给的是美元分，而 Steam 国区定价
+系统性比真实汇率低 5~10%，用 7.1 直接乘会把价格高估、把亏的说成赚的。
+折算比只能在 merge 阶段用 priceoverview 的美元报价 / 人民币报价标定。
+
+--fake 不联网，两个阶段都用合成数据跑一遍，用于验证链路。
 """
 from __future__ import annotations
 
 import argparse
+import glob
 import json
 import os
 import random
@@ -25,23 +33,24 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fees
 import thirdparty
-from store import (connect, candidates, insert_quotes, latest_quotes,
-                   meta_get, meta_set, purge_old, set_nameid, stats,
-                   upsert_items, need_nameid)
+from store import (connect, latest_quotes, meta_get, meta_set, purge_old,
+                   stats, upsert_items, upsert_quotes)
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ARB_DATA 让 CI 把产物直接写进 data 分支的克隆目录
 DATA = os.environ.get("ARB_DATA") or os.path.join(BASE, "data")
 APPID = 730
 
-# 本轮采集的硬截止时间点（monotonic）。CI 上超时就整轮白跑，
-# 所以宁可少采一点也要自己先收工，把已经拿到的写回去。
+# 轮次长度（秒）。要和 collect.yml 的 cron 对齐：同一轮里所有 shard 必须
+# 算出同一个窗口，否则会重复采同一批物品、漏掉另一批。
+ROUND_SECONDS = 1800
+
+# 本轮采集的硬截止时间点（monotonic）。CI 上超时会被硬杀，那时一步都没
+# 提交，整轮白跑；所以宁可少采一点也要自己先收工，把拿到的写出去。
 _DEADLINE = None
 
-# 本轮各环节的成败计数，跟着 latest.json 一起导出。
-# 用途：CI 上「采集失败也 exit 0」是为了保住旧数据，但那样从外面看不出
-# 是「Steam 连不上」还是「今天本来就没变化」。有了 health，汇总步骤就能
-# 直接判断并标红，不用人去翻日志。
+# 各环节成败，跟着 latest.json 一起导出。CI 上采集失败也 exit 0（为了保住
+# 旧数据），有了 health 汇总步骤才能分辨「Steam 被拦」和「本来没变化」。
 _HEALTH = {}
 
 
@@ -64,8 +73,8 @@ def mark(key: str, ok: bool, detail: str = "") -> None:
 
 
 def usd_cny() -> float:
-    """汇率：优先读环境变量，其次读 data/rate.json，最后兜底 7.10。
-    汇率错了整体比例会偏，所以允许手动覆盖。"""
+    """真实汇率，只用来把 Waxpeer 的美元报价换成人民币买入价。
+    不能用来换算 Steam 盘口 —— 那个要用 merge 阶段标定的折算比。"""
     env = os.environ.get("USD_CNY")
     if env:
         try:
@@ -82,198 +91,236 @@ def usd_cny() -> float:
     return 7.10
 
 
-def pick_batch(con, pool_size: int, batch: int) -> list[dict]:
-    """按 meta 里的游标轮转取一批，保证每轮打不同的物品。
+def round_index() -> int:
+    return int(time.time() // ROUND_SECONDS)
 
-    注意：游标不在这里推进 —— 提前收工时可能只采了一半，这时推进整批
-    会让没采到的那部分被跳过。真正的推进在 advance_cursor。
+
+def shard_slice(names: list[str], shard: int, shards: int,
+                batch: int) -> list[str]:
+    """按时间算出本轮该采哪一段。
+
+    不用数据库里的游标：collect 阶段是 N 个并行 job、彼此看不到状态，
+    读到的游标随时会过期。用「当前轮次」推位置是纯函数，同一个 job 内
+    结果稳定，跨 job 也能对齐。
     """
-    rows = candidates(con, appid=APPID, min_volume=30, limit=pool_size)
-    if not rows:
+    if not names or batch <= 0 or shards <= 0:
         return []
-    cursor = int(meta_get(con, "rotation_cursor", 0) or 0)
-    cursor %= len(rows)
-    return (rows[cursor:] + rows[:cursor])[:batch]
+    pool = len(names)
+    per_round = shards * batch
+    if per_round >= pool:
+        # 一轮就能扫完整个池子：shard 之间均分，不必轮转
+        seg = names[shard::shards]
+        return seg[:batch]
+    start = (round_index() * per_round) % pool
+    rot = names[start:] + names[:start]
+    return rot[shard * batch:(shard + 1) * batch]
 
 
-def advance_cursor(con, pool_size: int, done: int) -> None:
-    """只推进实际采到的件数，保证一轮被打断也不会漏物品。"""
-    if done <= 0:
-        return
-    rows = candidates(con, appid=APPID, min_volume=30, limit=pool_size)
-    if not rows:
-        return
-    cursor = int(meta_get(con, "rotation_cursor", 0) or 0)
-    meta_set(con, "rotation_cursor", (cursor + done) % len(rows))
+# ---------------- collect 阶段 ----------------
 
-
-def pick_need_nameid(con, budget: int) -> list[str]:
-    """挑成交量最高、但还没有 nameid 的物品。
-
-    没有 nameid 就查不了求购价，也就进不了候选池 —— 所以必须有一支
-    专门的队伍去补，否则会死锁（池子只收有 nameid 的，而没有 nameid 的
-    永远拿不到 nameid）。
-    """
-    if budget <= 0:
-        return []
-    cur = con.execute(
-        """SELECT hash_name FROM items
-           WHERE appid=? AND nameid IS NULL AND volume>0
-           ORDER BY volume DESC LIMIT ?""", (APPID, budget))
-    return [r["hash_name"] for r in cur.fetchall()]
-
-
-def run_fake(args) -> None:
-    """生成合成数据跑通全链路，不联网。"""
-    import steam as st
-    rnd = random.Random(42)
-    rows = []
-    now = int(time.time())
-    for i in range(80):
-        hn = f"Fake Item {i:03d}"
-        buy = round(rnd.uniform(3, 400), 2)
-        # 让一部分物品「看起来很赚」，一部分亏，便于检查排序
-        sell = round(buy * rnd.uniform(1.0, 1.45), 2)
-        bid = round(sell * rnd.uniform(0.75, 0.98), 2)
-        net = fees.net_from_buyer(sell)
-        rows.append({
-            "ts": now, "appid": APPID, "hash_name": hn,
-            "sell_cny": sell, "bid_cny": bid, "net_cny": net,
-            "volume": rnd.randint(5, 900),
-            "src_buy_cny": buy, "src_name": "fake",
-            "ratio": round(net / buy, 4) if buy else None,
-        })
-    con = connect(args.db)
-    insert_quotes(con, rows)
-    upsert_items(con, [{"hash_name": r["hash_name"], "volume": r["volume"],
-                        "nameid": 1000 + i} for i, r in enumerate(rows)])
-    meta_set(con, "fake", 1)
-    # 假数据也要填 health，否则测汇总步骤时永远是空的，测不出标红逻辑。
-    mark("thirdparty", True, "fake")
-    mark("steam_list", True, "fake")
-    mark("nameid", True, "fake")
-    mark("steam_orders", True, "fake")
-    log(f"[fake] 写入 {len(rows)} 条合成报价")
-    export(args, con)
-
-
-def run_real(args) -> None:
+def fetch_candidates(log_prefix: str = "") -> dict[str, dict] | None:
+    """第三方买入价。两个站都失败才返回 None。"""
     rate = usd_cny()
-    log(f"汇率 USD→CNY = {rate}")
-    con = connect(args.db)
-
-    # 1. 第三方买入价
     wax, skin = {}, {}
     try:
         wax = thirdparty.fetch_waxpeer(rate)
-        log(f"Waxpeer  {len(wax)} 条")
+        log(f"{log_prefix}Waxpeer  {len(wax)} 条")
     except Exception as e:
-        log(f"Waxpeer 失败：{e}")
+        log(f"{log_prefix}Waxpeer 失败：{e}")
     try:
         skin = thirdparty.fetch_skinport()
-        log(f"Skinport {len(skin)} 条")
+        log(f"{log_prefix}Skinport {len(skin)} 条")
     except Exception as e:
-        log(f"Skinport 失败：{e}")
+        log(f"{log_prefix}Skinport 失败：{e}")
     if not wax and not skin:
         mark("thirdparty", False, "Skinport 和 Waxpeer 都失败")
-        raise SystemExit("两家第三方都拿不到数据，本轮放弃（保留旧数据）")
-    buy_map = thirdparty.merge(wax, skin)
-    buy_by_name = {r["name"]: r for r in buy_map}
-    mark("thirdparty", True, f"waxpeer {len(wax)} / skinport {len(skin)} / 合并 {len(buy_by_name)}")
-    log(f"合并后 {len(buy_by_name)} 条有买入价")
+        return None
+    rows = thirdparty.merge(wax, skin)
+    mark("thirdparty", True,
+         f"waxpeer {len(wax)} / skinport {len(skin)} / 合并 {len(rows)}")
+    return {r["name"]: r for r in rows}
 
-    # 2. 物品字典（Steam 列表接口）
+
+def run_collect(args) -> None:
+    """抓一批物品页盘口，写 shard JSON。不连数据库。"""
     import steam as st
-    try:
-        listed = st.iter_all(APPID, count=100, max_pages=args.pages,
-                             on_page=lambda p, n, t: log(f"  列表第 {p} 页 {n}/{t}"),
-                             should_stop=out_of_time)
-        upsert_items(con, [{"hash_name": r["hash_name"],
-                            "volume": r["sell_listings"],
-                            "tradable": 1} for r in listed])
-        if listed:
-            mark("steam_list", True, f"{len(listed)} 件")
-        else:
-            mark("steam_list", False, "一件都没拿到（被拦或全空）")
-        log(f"物品字典更新 {len(listed)} 条")
-    except Exception as e:
-        mark("steam_list", False, str(e))
-        log(f"Steam 列表接口不可用（{e}），跳过字典更新")
-        listed = []
 
-    # 3a. 先补 nameid：没有它连候选池都进不了，会死锁
-    todo = pick_need_nameid(con, args.nameid_budget)
-    if todo:
-        log(f"补 nameid {len(todo)} 件（每件要抓一次物品页，很贵）")
-        ok = 0
-        for hn in todo:
-            if out_of_time():
-                log("  时间预算用完，nameid 补到一半停下")
-                break
-            try:
-                nid = st.fetch_nameid(hn, APPID)
-            except Exception as e:
-                log(f"  nameid 失败 {hn}: {e}")
-                continue
-            if nid:
-                set_nameid(con, hn, nid, APPID)
-                ok += 1
-        log(f"  补到 {ok}/{len(todo)}")
-        mark("nameid", ok > 0, f"{ok}/{len(todo)}")
-    else:
-        mark("nameid", True, "本轮不需要补")
+    cand = fetch_candidates(f"shard{args.shard} ")
+    if cand is None:
+        _write_shard(args, [], "两家第三方都拿不到数据")
+        return
 
-    # 3b. 从已有 nameid 的池子里轮转取一批查求购价
-    batch = pick_batch(con, args.pool, args.batch)
-    log(f"本轮采集 {len(batch)} 件")
-    got = 0
-    scanned = 0        # 真正发过请求的件数，游标按它推进
-    err = ""
-    for it in batch:
+    names = sorted(cand)
+    picked = shard_slice(names, args.shard, args.shards, args.batch)
+    log(f"本轮 {len(names)} 个候选，分给 shard{args.shard} 的 {len(picked)} 件")
+    if not picked:
+        _write_shard(args, [], "")
+        return
+
+    items = []
+    tried = 0        # 真发过请求的件数
+    ok = 0
+    throttled = 0
+    last_err = ""
+    for hn in picked:
         if out_of_time():
-            log("  时间预算用完，求购价采到一半停下")
+            log("  时间预算用完，提前收工")
             break
-        hn = it["hash_name"]
-        nameid = it.get("nameid")
-        if not nameid:
-            continue
         try:
-            hist = st.orders_histogram(nameid)
-        except Exception as e:
-            log(f"  求购价失败 {hn}: {e}")
-            err = f"{hn}: {e}"
-            break          # 多半是被限流了，本轮收工
-        scanned += 1
-        if not hist:
+            ob = st.item_orderbook(hn, APPID)
+        except st.RateLimited as e:
+            tried += 1
+            throttled += 1
+            last_err = f"{hn}: {e}"
+            # 被限流不代表这批没救：间隔会自己拉长，恢复后还能继续拿。
+            # 只有连续失败到预算见底才走不下去。
+            if throttled >= args.give_up:
+                log(f"  连续 {throttled} 次被限流，收工")
+                break
             continue
-        b = buy_by_name.get(hn) or {}
-        sell = hist.get("lowest_sell_cny")
-        bid = hist.get("bid_cny")
-        buy_cny = b.get("buy_cny")
-        net = fees.net_from_buyer(sell) if sell else None      # 按最低挂单价卖
-        net_bid = fees.net_from_buyer(bid) if bid else None    # 按求购价秒卖
-        got += 1
-        insert_quotes(con, [{
-            "ts": int(time.time()), "hash_name": hn,
-            "sell_cny": sell, "bid_cny": bid,
-            "net_cny": net_bid if net_bid else net,
-            "volume": it.get("volume"),
-            "src_buy_cny": buy_cny, "src_name": b.get("src"),
-            "ratio": round((net_bid if net_bid else net) / buy_cny, 4)
-                     if (buy_cny and (net_bid or net)) else None,
-        }])
-    log(f"成功写入 {got} 条（实际请求 {scanned} 件）")
-    # 判断标准：只要真的发出去过请求并且有回音，就算这条链路通。
-    # 一件都没成交（got=0）可能只是这批恰好没数据，不等于被拦。
-    mark("steam_orders", scanned > 0,
-         f"{got}/{scanned}" + (f" · 中断于 {err}" if err else ""))
-    advance_cursor(con, args.pool, scanned)
+        except st.ParseError as e:
+            tried += 1
+            last_err = f"{hn}: {e}"
+            continue
+        except Exception as e:
+            tried += 1
+            last_err = f"{hn}: {e}"
+            continue
+        tried += 1
+        throttled = 0
+        c = cand[hn]
+        items.append({
+            "n": hn,
+            "usd_bid": ob["usd_bid"], "usd_sell": ob["usd_sell"],
+            "buy": c["buy_cny"], "src": c["src"], "qty": c.get("src_qty") or 0,
+            "depth": ob["bid_depth"], "blevels": ob["bid_levels"],
+            "buys": ob["buy_orders"], "sells": ob["sell_orders"],
+            "ts": int(time.time()),
+        })
+        ok += 1
+        if ok % 20 == 0:
+            log(f"  已采 {ok}/{len(picked)}")
 
-    # 4. 维护 + 导出
-    n = purge_old(con, 30)
-    if n:
-        log(f"清理 30 天前报价 {n} 条")
-    meta_set(con, "last_run", int(time.time()))
+    detail = f"{ok}/{tried} 成功" + (f" · {last_err}" if last_err else "")
+    mark("steam_orders", tried > 0, detail)
+    log(f"shard{args.shard} 完成：{detail}")
+    _write_shard(args, items, "")
+
+
+def _write_shard(args, items: list[dict], err: str) -> None:
+    d = args.out_dir
+    os.makedirs(d, exist_ok=True)
+    fp = os.path.join(d, f"shard-{args.shard:02d}.json")
+    out = {
+        "shard": args.shard, "shards": args.shards,
+        "round": round_index(), "ts": int(time.time()),
+        "tried": len(items), "err": err,
+        "health": _HEALTH,
+        "items": items,
+    }
+    tmp = fp + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, fp)
+    log(f"写出 {fp}（{len(items)} 件，{os.path.getsize(fp)/1024:.1f} KB）")
+
+
+# ---------------- merge 阶段 ----------------
+
+def load_shards(in_dir: str) -> tuple[list[dict], dict, int]:
+    """读回所有 shard。返回 (物品列表, 合并的 health, 本轮 round)。"""
+    files = sorted(glob.glob(os.path.join(in_dir, "shard-*.json")))
+    items: list[dict] = []
+    health: dict = {}
+    rounds: list[int] = []
+    for fp in files:
+        try:
+            with open(fp, encoding="utf-8") as f:
+                j = json.load(f)
+        except Exception as e:
+            log(f"跳过 {os.path.basename(fp)}：{e}")
+            continue
+        rows = j.get("items") or []
+        items.extend(rows)
+        rounds.append(int(j.get("round") or 0))
+        for k, v in (j.get("health") or {}).items():
+            # 任何一台机器失败就记失败，不要被后面的成功覆盖
+            if k not in health or not health[k].get("ok"):
+                health[k] = v
+        log(f"{os.path.basename(fp)}  {len(rows)} 件")
+    rnd = max(rounds) if rounds else 0
+    return items, health, rnd
+
+
+def run_merge(args) -> None:
+    """把 shard 结果折成人民币、算面值比、写库、导出。"""
+    items, health, rnd = load_shards(args.in_dir)
+    _HEALTH.update(health)
+
+    con = connect(args.db)
+    if not items:
+        mark("merge", False, "没有任何 shard 数据")
+        log("没有可合并的数据，保留旧库")
+        export(args, con)
+        return
+
+    # 标定折算比：只能在这个阶段做，因为要问 Steam 的 priceoverview。
+    import steam as st
+    sample = [it["n"] for it in
+              sorted(items, key=lambda x: -(x.get("usd_sell") or 0))
+              if (x.get("usd_sell") or 0) >= 100][:args.fx_samples]
+    fx_info = st.market_factor(sample) if sample else {"factor": None, "n": 0}
+    fx = fx_info.get("factor")
+    if fx:
+        mark("fx", True,
+             f"{fx} ×{fx_info['n']} 样本 离散{(fx_info.get('spread') or 0)*100:.2f}%")
+        log(f"折算比 1 USD = ¥{fx}（{fx_info['n']} 个样本）")
+    else:
+        # 标定失败就用真实汇率兜底，但必须标出来 —— 这时候数字会偏高。
+        fx = usd_cny()
+        mark("fx", False, f"标定失败，退回汇率 {fx}（价格可能偏高约 6%）")
+        log(f"折算比标定失败，退回真实汇率 {fx}")
+
+    rows = []
+    now = int(time.time())
+    skipped = 0
+    for it in items:
+        ub, us = it.get("usd_bid"), it.get("usd_sell")
+        if not ub:
+            skipped += 1
+            continue
+        bid_cny = round(ub / 100.0 * fx, 2)
+        sell_cny = round(us / 100.0 * fx, 2) if us else None
+        buy = it.get("buy")
+        net = fees.net_from_buyer(bid_cny)              # 挂求购价，立刻成交
+        net_sell = fees.net_from_buyer(sell_cny) if sell_cny else None
+        rows.append({
+            "hash_name": it["n"], "ts": it.get("ts") or now,
+            "first_ts": now,
+            "sell_cny": sell_cny, "bid_cny": bid_cny,
+            "net_cny": net, "net_sell_cny": net_sell,
+            "usd_bid": ub, "usd_sell": us, "fx": fx,
+            "bid_depth": it.get("depth"), "bid_levels": it.get("blevels"),
+            "sell_orders": it.get("sells"), "buy_orders": it.get("buys"),
+            "src_buy_cny": buy, "src_name": it.get("src"),
+            "src_qty": it.get("qty"),
+            "ratio": round(net / buy, 4) if buy else None,
+            "ratio_sell": round(net_sell / buy, 4)
+                          if (buy and net_sell) else None,
+        })
+
+    n = upsert_quotes(con, rows)
+    upsert_items(con, [{"hash_name": it["n"]} for it in items])
+    mark("merge", True,
+         f"{n} 条入库 / {len(items)} 件采到 / round {rnd}"
+         + (f" / {skipped} 件无求购价跳过" if skipped else ""))
+    log(f"入库 {n} 条（{skipped} 件没有求购价，跳过）")
+
+    gone = purge_old(con, 7)
+    if gone:
+        log(f"清理 7 天前没再出现的 {gone} 条")
+    meta_set(con, "last_merge", int(time.time()))
+    meta_set(con, "fx", fx)
     log(f"库状态：{stats(con)}")
     export(args, con)
 
@@ -282,24 +329,34 @@ def export(args, con) -> None:
     """给前端用的静态 JSON：只放排序后的前 N 条，控制体积。"""
     rows = latest_quotes(con, appid=APPID, within_hours=args.within_hours,
                          limit=args.export_limit)
+    fx = None
+    try:
+        fx = float(meta_get(con, "fx"))
+    except Exception:
+        pass
     out = {
         "generated": int(time.time()),
         "rate_usd_cny": usd_cny(),
+        "fx": fx,
         "currency": "CNY",
         "count": len(rows),
-        "note": "ratio = Steam 扣费后净得 ÷ 第三方买入价。余额折现要再乘 0.75~0.85。",
-        # 每轮各环节的成败。CI 采集失败也 exit 0（为了保住旧数据），
-        # 所以「这一轮到底通不通」只能靠它判断，汇总步骤读这个字段标红绿。
+        "note": ("ratio = 按 Steam 求购价卖出的净得 ÷ 第三方买入价，1 以上才不亏面值；"
+                 "余额折现还要再乘 0.75~0.85。bid/sell 都由盘口美元分按国区折算比换成人民币。"),
         "health": _HEALTH,
         "items": [{
             "n": r["hash_name"],
             "sell": r["sell_cny"],
             "bid": r["bid_cny"],
             "net": r["net_cny"],
+            "net_sell": r["net_sell_cny"],
             "buy": r["src_buy_cny"],
             "src": r["src_name"],
-            "vol": r["volume"],
+            "qty": r["src_qty"],
+            "depth": r["bid_depth"],
+            "orders": r["buy_orders"],
+            "sell_orders": r["sell_orders"],
             "ratio": r["ratio"],
+            "ratio_sell": r["ratio_sell"],
             "ts": r["ts"],
         } for r in rows],
     }
@@ -309,30 +366,110 @@ def export(args, con) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, fp)
-    size = os.path.getsize(fp) / 1024
-    log(f"导出 {fp}（{len(rows)} 条，{size:.1f} KB）")
+    log(f"导出 {fp}（{len(rows)} 条，{os.path.getsize(fp)/1024:.1f} KB）")
+
+
+# ---------------- fake：离线跑通两个阶段 ----------------
+
+def run_fake(args) -> None:
+    rnd = random.Random(42)
+    d = args.out_dir or os.path.join(DATA, "_fake_shards")
+    os.makedirs(d, exist_ok=True)
+    per = max(1, args.batch)
+    for s in range(max(1, args.shards)):
+        items = []
+        for i in range(per):
+            k = s * per + i
+            buy = round(rnd.uniform(3, 400), 2)
+            usd_sell = int(round(buy * rnd.uniform(1.0, 1.45) / 6.8 * 100))
+            usd_bid = int(round(usd_sell * rnd.uniform(0.75, 0.98)))
+            items.append({
+                "n": f"Fake Item {k:03d}",
+                "usd_bid": usd_bid, "usd_sell": usd_sell,
+                "buy": buy, "src": "fake", "qty": rnd.randint(1, 50),
+                "depth": rnd.randint(0, 60), "blevels": rnd.randint(1, 20),
+                "buys": rnd.randint(1, 900), "sells": rnd.randint(1, 900),
+                "ts": int(time.time()),
+            })
+        fp = os.path.join(d, f"shard-{s:02d}.json")
+        with open(fp, "w", encoding="utf-8") as f:
+            json.dump({"shard": s, "shards": args.shards,
+                       "round": round_index(), "ts": int(time.time()),
+                       "tried": len(items), "err": "",
+                       "health": {"thirdparty": {"ok": True, "detail": "fake"},
+                                  "steam_orders": {"ok": True, "detail": "fake"}},
+                       "items": items}, f, ensure_ascii=False)
+    log(f"[fake] 写了 {args.shards} 个 shard 到 {d}")
+    # merge 阶段：不联网，折算比用固定值
+    args.in_dir = d
+    args.fx_samples = 0
+    merge_fake(args)
+
+
+def merge_fake(args) -> None:
+    items, health, rnd = load_shards(args.in_dir)
+    _HEALTH.update(health)
+    con = connect(args.db)
+    fx = 6.80
+    rows = []
+    now = int(time.time())
+    for it in items:
+        bid_cny = round(it["usd_bid"] / 100.0 * fx, 2)
+        sell_cny = round(it["usd_sell"] / 100.0 * fx, 2)
+        net = fees.net_from_buyer(bid_cny)
+        net_sell = fees.net_from_buyer(sell_cny)
+        rows.append({
+            "hash_name": it["n"], "ts": it["ts"], "first_ts": now,
+            "sell_cny": sell_cny, "bid_cny": bid_cny,
+            "net_cny": net, "net_sell_cny": net_sell,
+            "usd_bid": it["usd_bid"], "usd_sell": it["usd_sell"], "fx": fx,
+            "bid_depth": it["depth"], "bid_levels": it["blevels"],
+            "sell_orders": it["sells"], "buy_orders": it["buys"],
+            "src_buy_cny": it["buy"], "src_name": it["src"],
+            "src_qty": it["qty"],
+            "ratio": round(net / it["buy"], 4),
+            "ratio_sell": round(net_sell / it["buy"], 4),
+        })
+    upsert_quotes(con, rows)
+    upsert_items(con, [{"hash_name": it["n"]} for it in items])
+    mark("fx", True, "fake")
+    mark("merge", True, f"fake {len(rows)} 条")
+    meta_set(con, "fx", fx)
+    log(f"[fake] 入库 {len(rows)} 条")
+    export(args, con)
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--mode", choices=("collect", "merge", "fake"),
+                    default="fake")
     ap.add_argument("--db", default="")
-    ap.add_argument("--batch", type=int, default=250, help="本轮查求购价的件数")
-    ap.add_argument("--pool", type=int, default=2000, help="候选池大小")
-    ap.add_argument("--pages", type=int, default=200, help="列表接口翻页上限")
-    ap.add_argument("--nameid-budget", type=int, default=60,
-                    help="本轮最多补多少个 nameid（每个要抓一次物品页，很贵）")
-    ap.add_argument("--export-limit", type=int, default=500)
+    ap.add_argument("--shard", type=int, default=0)
+    ap.add_argument("--shards", type=int, default=4, help="总共有几个并行 job")
+    ap.add_argument("--batch", type=int, default=140, help="每个 shard 采几件")
+    ap.add_argument("--give-up", type=int, default=25,
+                    help="连续被限流多少次就放弃本 shard")
+    ap.add_argument("--out-dir", default="")
+    ap.add_argument("--in-dir", default="")
+    ap.add_argument("--fx-samples", type=int, default=6,
+                    help="标定折算比用几个样本（每个 2 次请求）")
+    ap.add_argument("--export-limit", type=int, default=800)
     ap.add_argument("--within-hours", type=int, default=48)
     ap.add_argument("--deadline", type=float, default=0,
-                    help="本轮最多干多少分钟，到点自己收工（CI 上传超时用）")
-    ap.add_argument("--fake", action="store_true")
+                    help="本轮最多干多少分钟，到点自己收工")
     a = ap.parse_args()
     if a.deadline > 0:
         set_deadline(a.deadline)
-    if a.fake:
-        run_fake(a)
+    if not a.out_dir:
+        a.out_dir = os.path.join(DATA, "shards")
+    if not a.in_dir:
+        a.in_dir = a.out_dir
+    if a.mode == "collect":
+        run_collect(a)
+    elif a.mode == "merge":
+        run_merge(a)
     else:
-        run_real(a)
+        run_fake(a)
 
 
 if __name__ == "__main__":

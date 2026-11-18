@@ -5,5 +5,6 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 data/latest.json
+data/shards/
 _tmp_*
 _shot.png

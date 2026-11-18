@@ -3,15 +3,21 @@ name: collect
 # Steam 社区市场在国内不可达，所以采集必须跑在境外出口上。
 # GitHub Actions 的 runner 由 Azure 托管，可以直接访问 steamcommunity.com。
 #
+# 为什么是「4 个 shard 并行 + 1 个 merge」而不是一个 job 串完：
+#   实测 Steam 对机房 IP 按接口区别对待 —— market/search/render 全 429，
+#   只能靠抓物品页 HTML 拿盘口。物品页吞吐约 12 件/分钟，一个 job 12 分钟
+#   只够采 140 件，而候选有 6000+。但每个 job 的出口 IP 不同、限流额度独立
+#   （连续 11 次探针拿到 11 个不同 IP），所以并行是唯一能放大的手段。
+#
 # 注意：
 #   * cron 最短 5 分钟，但实际会延迟 5~15 分钟，别指望准点
 #   * 私有仓库免费额度 2000 分钟/月，这种跑法会超额 → 仓库设成 public
-#   * 数据存在 data 分支，每轮 fetch 下来、跑完 push 回去（depth=1，不会越拖越大）
+#   * 数据存在 data 分支，merge job 每轮 fetch 下来、算完 push 回去（depth=1）
 
 on:
   schedule:
-    # 每 30 分钟一轮。不要改成 */10 —— 一轮实际要跑 15~20 分钟，
-    # 间隔比耗时短的话队列会越堆越多，最后全是排队等超时的废跑。
+    # 每 30 分钟一轮。一轮实际 10~15 分钟，间隔比耗时短的话队列会越堆越多，
+    # 最后全是排队等超时的废跑。
     - cron: "*/30 * * * *"
   workflow_dispatch:        # 允许手动点一次，方便第一次验证
   push:
@@ -26,7 +32,7 @@ on:
 
 permissions:
   contents: write
-  # 前端是纯静态页，直接由本 job 发布到 Pages（不用再单独开一个 workflow）
+  # 前端是纯静态页，直接由本 workflow 发布到 Pages（不用再单独开一个）
   pages: write
   id-token: write
 
@@ -37,18 +43,74 @@ concurrency:
 env:
   DATA_DIR: /tmp/arbdata
   REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+  # 并行路数。public 仓库同一 workflow 并发上限是 20 个 job，留足余量。
+  SHARDS: "4"
 
 jobs:
-  run:
+  # ---------- 阶段一：N 台机器各抓一段，只产出 JSON，不碰数据库 ----------
+  collect:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 18
+    strategy:
+      # 一路挂掉不该拖累其它路：它们各自采到的数据仍然有用
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
     steps:
-      - name: 取主分支代码
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: 抓取本片
+        env:
+          USD_CNY: ${{ vars.USD_CNY }}
+          STEAM_GAP: "2.5"
+          SHARD_ID: ${{ matrix.shard }}
+          OUT_DIR: /tmp/shards
+        run: |
+          set +e
+          cd collector
+          # 请求预算：120 件 × 2.5s ≈ 5 分钟纯间隔，实测含 429 退避约 10 分钟。
+          # --deadline 12 让它自己收工，绝不撞 job 的 18 分钟硬超时（硬杀时
+          # 一步都没提交，整片白采）。
+          python run.py --mode collect \
+            --shard "$SHARD_ID" --shards "$SHARDS" \
+            --batch 120 --deadline 12 --out-dir "$OUT_DIR"
+          echo "采集 exit=$?"
+          # 采不到也要写出空 shard：merge 靠它的 health 判断这一路是被拦还是没数据
+          ls -la "$OUT_DIR" || true
+          exit 0
+
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: shard-${{ matrix.shard }}
+          path: /tmp/shards/shard-*.json
+          if-no-files-found: warn
+          retention-days: 1
+
+  # ---------- 阶段二：汇总、标定折算比、写库、出页面 ----------
+  merge:
+    needs: collect
+    # 4 路全挂也照样跑：库里还留着上一轮的数据，页面继续能用
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/download-artifact@v4
+        with:
+          # 4 个 shard 落到同一个目录，merge 会自己按文件名读
+          pattern: shard-*
+          path: /tmp/shards
+          merge-multiple: true
 
       - name: 准备 data 分支
         run: |
@@ -69,22 +131,20 @@ jobs:
           fi
           mkdir -p data
 
-      - name: 采集
+      - name: 合并入库
         env:
           ARB_DB: /tmp/arbdata/data/arb.db
           ARB_DATA: /tmp/arbdata/data
           USD_CNY: ${{ vars.USD_CNY }}
-          STEAM_GAP: "3.5"
+          STEAM_GAP: "2.5"
         run: |
           set +e
           cd collector
-          # 请求预算：列表 60 页 + 补 30 个 nameid + 查 120 件求购价
-          #   = 210 个请求 × 3.5s ≈ 12 分钟，留出 checkout/push 的余量
-          # --deadline 12：采集自己卡 12 分钟，到点收工，绝不撞 job 的 25 分钟硬超时
-          python run.py --batch 120 --pages 60 --nameid-budget 30 --deadline 12
-          rc=$?
-          echo "collector exit=$rc"
-          # 采集失败也继续：可能已经有部分数据入库，导出旧数据比什么都没有好
+          ls -la /tmp/shards || true
+          # 折算比标定要问 Steam 的 priceoverview（每样本 2 次请求），
+          # 6 个样本 = 12 次，几十秒。
+          python run.py --mode merge --in-dir /tmp/shards --fx-samples 6
+          echo "合并 exit=$?"
           ls -la "$ARB_DATA"
           exit 0
 
@@ -120,9 +180,9 @@ jobs:
           # 只能看 health，不能看 job 是绿是红。
           h = d.get("health") or {}
           parts = [("thirdparty", "第三方买入价"),
-                   ("steam_list", "Steam 物品列表"),
-                   ("nameid", "补 nameid"),
-                   ("steam_orders", "Steam 求购价")]
+                   ("steam_orders", "Steam 物品页"),
+                   ("fx", "汇率折算比"),
+                   ("merge", "合并入库")]
           dead = []
           print("")
           print("| 环节 | 状态 | 详情 |")
@@ -133,35 +193,34 @@ jobs:
                   print("| %s | ❔ 未记录 | 这一轮没走到 |" % label)
                   continue
               ok = bool(v.get("ok"))
-              if not ok and k in ("steam_list", "steam_orders"):
+              if not ok and k in ("steam_orders", "fx"):
                   dead.append(label)
               detail = (v.get("detail") or "").replace("|", "\\|")
               print("| %s | %s | %s |" % (label, "✅" if ok else "❌", detail))
 
           age = (time.time() - d["generated"]) / 60
           print("")
-          print("- 手上 %d 件，数据生成于 %s（%.0f 分钟前）"
-                % (d["count"],
+          print("- 手上 %d 件，折算比 1 USD = ¥%s，数据生成于 %s（%.0f 分钟前）"
+                % (d["count"], d.get("fx") or "—",
                    time.strftime("%Y-%m-%d %H:%M", time.localtime(d["generated"])),
                    age))
           if dead:
-              sep = "、"
-              msg = "%s 失败 —— 多半是 runner 出口被 Steam 拦了，本轮页面数字不变" \
-                    % sep.join(dead)
+              msg = ("%s 失败 —— 多半是 runner 出口被 Steam 拦了，本轮页面数字不变"
+                     % "、".join(dead))
               print("")
               print("**❌ %s**" % msg)
               print("::error::%s" % msg)
           top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
           if top:
               print("")
-              print("| 面值比 | 物品 | 买入 | 净得 | 24h 成交 |")
+              print("| 面值比 | 物品 | 买入 | 净得 | 买盘深度 |")
               print("| --- | --- | --- | --- | --- |")
               for it in top:
                   # 物品名里几乎都带 " | "（AK-47 | Redline），不转义会把表格列撑破
                   name = (it.get("n") or "").replace("|", "\\|")
                   print("| %.3f | %s | ¥%.2f | ¥%.2f | %s |"
                         % (it.get("ratio") or 0, name, it.get("buy") or 0,
-                           it.get("net") or 0, it.get("vol") or 0))
+                           it.get("net") or 0, it.get("depth") or 0))
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -182,8 +241,9 @@ jobs:
         with:
           path: _site
 
+  # ---------- 阶段三：发布 ----------
   deploy:
-    needs: run
+    needs: merge
     runs-on: ubuntu-latest
     # 采集那步哪怕标红，只要这份数据还写得出来，页面也该继续用旧的数字，
     # 所以只在 job 被取消时跳过，失败也照样部署。

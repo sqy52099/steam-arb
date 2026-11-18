@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-SQLite 存储层：items 物品字典 / quotes 报价历史 / meta 采集进度。
+SQLite 存储层：items 物品名册 / quotes 最新报价 / meta 杂项。
 
-GitHub Actions 的机器每次都是新的，所以 db 文件每轮从 data 分支 checkout
-下来，跑完再 push 回去；30 天以上的报价自动清掉，文件不会无限长大。
+为什么 quotes 每个物品只留一条最新（而不是攒历史）：
+  改成多 job 并行后，一轮能采 500+ 件，一天 48 轮 ≈ 2.7 万行/天，
+  30 天就是 80 万行。这个 db 每轮要从 data 分支 checkout 下来、跑完再
+  push 回去，体积一大光传输就要几十秒。前端只需要「当前快照」，
+  历史趋势以后单独做聚合表，不该让采集链路背这个包袱。
+  现在最坏也就 6580 行（第三方给的全部候选），文件几百 KB。
 
-设计要点：
-  * items 表存 item_nameid —— 这个值终生不变，存下来就再也不用抓物品页，
-    能把每轮请求量砍掉一半（见方案「关键点」）。
-  * quotes 用 (ts, appid, hash_name) 做主键，重复写入用 INSERT OR REPLACE。
-  * meta 表放轮转游标 rotation_cursor，配合 item_nameid 做分批采集。
+db 的所有权：只有 merge job 写它。采集 shard 只产出 JSON，不碰 db ——
+这样多个 shard 并行时不会互相覆盖。
 """
 from __future__ import annotations
 
@@ -20,36 +21,46 @@ import time
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.environ.get("ARB_DB", os.path.join(BASE, "..", "data", "arb.db"))
-KEEP_DAYS = 30
+KEEP_DAYS = 7
+
+# 表结构改过一次：v1 是 (ts,...) 主键攒历史，v2 是 (appid,hash_name) 主键存快照。
+# 版本号写进 meta，对不上就整表重建（这库本来就是可再生的缓存）。
+SCHEMA_VERSION = "2"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
     appid      INTEGER NOT NULL,
     hash_name  TEXT    NOT NULL,
-    nameid     INTEGER,                 -- Steam item_nameid，终生不变
     tradable   INTEGER DEFAULT 1,
-    volume     INTEGER DEFAULT 0,       -- 最近一次看到的 24h 成交量
     first_seen INTEGER NOT NULL,
     last_seen  INTEGER NOT NULL,
     PRIMARY KEY (appid, hash_name)
 );
-CREATE INDEX IF NOT EXISTS idx_items_volume ON items(appid, volume DESC);
 
 CREATE TABLE IF NOT EXISTS quotes (
-    ts           INTEGER NOT NULL,
     appid        INTEGER NOT NULL,
     hash_name    TEXT    NOT NULL,
-    sell_cny     REAL,        -- Steam 最低挂单价（买家付）
-    bid_cny      REAL,        -- Steam 最高求购价（买家付），可能为空
-    net_cny      REAL,        -- 扣完 Steam+发行商费后卖家净得
-    volume       INTEGER,
-    src_buy_cny  REAL,        -- 第三方买入价
+    ts           INTEGER NOT NULL,   -- 最近一次观测时间
+    first_ts     INTEGER NOT NULL,   -- 第一次观测时间（看这物品跟踪了多久）
+    sell_cny     REAL,               -- Steam 最低挂单价（买家付，人民币）
+    bid_cny      REAL,               -- Steam 最高求购价（买家付，人民币）
+    net_cny      REAL,               -- 按求购价秒卖，扣费后卖家净得
+    net_sell_cny REAL,               -- 按最低挂单价卖掉，扣费后卖家净得
+    usd_bid      INTEGER,            -- 盘口原始值，单位美元分（留作校验）
+    usd_sell     INTEGER,
+    fx           REAL,               -- 本轮用的「国区人民币÷美元」折算比
+    bid_depth    INTEGER,            -- 买盘前 10 档可承接件数
+    bid_levels   INTEGER,            -- 买盘档数
+    sell_orders  INTEGER,            -- 在售挂单件数
+    buy_orders   INTEGER,            -- 求购单件数
+    src_buy_cny  REAL,               -- 第三方买入价
     src_name     TEXT,
-    ratio        REAL,        -- net_cny / src_buy_cny
-    PRIMARY KEY (ts, appid, hash_name)
+    src_qty      INTEGER,            -- 第三方库存量
+    ratio        REAL,               -- net_cny / src_buy_cny
+    ratio_sell   REAL,               -- net_sell_cny / src_buy_cny
+    PRIMARY KEY (appid, hash_name)
 );
-CREATE INDEX IF NOT EXISTS idx_quotes_item ON quotes(appid, hash_name, ts DESC);
-CREATE INDEX IF NOT EXISTS idx_quotes_ts   ON quotes(ts);
+CREATE INDEX IF NOT EXISTS idx_quotes_ratio ON quotes(appid, ratio DESC);
 
 CREATE TABLE IF NOT EXISTS meta (
     k TEXT PRIMARY KEY,
@@ -65,18 +76,33 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     con.execute("PRAGMA synchronous=NORMAL")
-    con.executescript(SCHEMA)
+    _migrate(con)
     return con
 
 
-# ---------------- meta ----------------
+def _migrate(con: sqlite3.Connection) -> None:
+    """老库（v1 攒历史那版）直接重建 quotes —— 里面的历史数据本来就是
+    每轮重新采的行情，丢了下一轮就补回来，不值得写迁移脚本。"""
+    exists = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='quotes'"
+    ).fetchone()
+    if exists:
+        cols = {r["name"] for r in con.execute("PRAGMA table_info(quotes)")}
+        if "first_ts" not in cols:
+            con.execute("DROP TABLE quotes")
+            con.commit()
+    con.executescript(SCHEMA)
+    con.execute(
+        "INSERT OR REPLACE INTO meta(k,v) VALUES('schema_version',?)",
+        (SCHEMA_VERSION,))
+
 
 def meta_get(con, k: str, default=None):
     r = con.execute("SELECT v FROM meta WHERE k=?", (k,)).fetchone()
     return r["v"] if r else default
 
 
-def meta_set(con, k: str, v):
+def meta_set(con, k: str, v) -> None:
     con.execute("INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)", (k, str(v)))
     con.commit()
 
@@ -84,7 +110,7 @@ def meta_set(con, k: str, v):
 # ---------------- items ----------------
 
 def upsert_items(con, rows: list[dict], appid: int = 730) -> int:
-    """rows: [{name/hash_name, volume?, tradable?, nameid?}]"""
+    """rows: [{name/hash_name, tradable?}]"""
     now = int(time.time())
     n = 0
     for r in rows:
@@ -92,104 +118,66 @@ def upsert_items(con, rows: list[dict], appid: int = 730) -> int:
         if not hn:
             continue
         con.execute(
-            """INSERT INTO items(appid,hash_name,nameid,tradable,volume,first_seen,last_seen)
-               VALUES(?,?,?,?,?,?,?)
+            """INSERT INTO items(appid,hash_name,tradable,first_seen,last_seen)
+               VALUES(?,?,?,?,?)
                ON CONFLICT(appid,hash_name) DO UPDATE SET
-                 volume   = COALESCE(excluded.volume, items.volume),
-                 tradable = COALESCE(excluded.tradable, items.tradable),
-                 nameid   = COALESCE(excluded.nameid, items.nameid),
-                 last_seen= excluded.last_seen""",
-            (appid, hn, r.get("nameid"), r.get("tradable", 1),
-             r.get("volume", 0), now, now),
-        )
+                 last_seen = excluded.last_seen""",
+            (appid, hn, r.get("tradable", 1), now, now))
         n += 1
     con.commit()
     return n
-
-
-def set_nameid(con, hash_name: str, nameid: int, appid: int = 730) -> None:
-    con.execute("UPDATE items SET nameid=? WHERE appid=? AND hash_name=?",
-                (int(nameid), appid, hash_name))
-    con.commit()
-
-
-def need_nameid(con, hash_name: str, appid: int = 730) -> bool:
-    r = con.execute("SELECT nameid FROM items WHERE appid=? AND hash_name=?",
-                    (appid, hash_name)).fetchone()
-    return not r or not r["nameid"]
-
-
-def candidates(con, appid: int = 730, min_volume: int = 30,
-               limit: int = 2000) -> list[dict]:
-    """候选池：成交量够、有 nameid 的物品。按成交量降序。"""
-    cur = con.execute(
-        """SELECT hash_name, nameid, volume FROM items
-           WHERE appid=? AND nameid IS NOT NULL AND volume>=?
-           ORDER BY volume DESC LIMIT ?""",
-        (appid, min_volume, limit))
-    return [dict(r) for r in cur.fetchall()]
-
-
-def rotation_slice(rows: list[dict], batch: int) -> list[dict]:
-    """按 nameid 轮转取一批，保证每轮打不同的物品，几轮覆盖全池。"""
-    if not rows:
-        return []
-    return rows[:batch] if len(rows) <= batch else rows[:batch]
 
 
 # ---------------- quotes ----------------
 
-def insert_quotes(con, rows: list[dict], appid: int = 730) -> int:
+QUOTE_COLS = (
+    "ts", "first_ts", "sell_cny", "bid_cny", "net_cny", "net_sell_cny",
+    "usd_bid", "usd_sell", "fx", "bid_depth", "bid_levels",
+    "sell_orders", "buy_orders", "src_buy_cny", "src_name", "src_qty",
+    "ratio", "ratio_sell",
+)
+
+
+def upsert_quotes(con, rows: list[dict], appid: int = 730) -> int:
+    """每件只留最新一条。first_ts 保留最早那次观测，不被覆盖。"""
     n = 0
+    ph = ",".join("?" * (len(QUOTE_COLS) + 2))
+    sets = ",".join(f"{c}=excluded.{c}" for c in QUOTE_COLS if c != "first_ts")
+    sql = (f"INSERT INTO quotes(appid,hash_name,{','.join(QUOTE_COLS)}) "
+           f"VALUES({ph}) "
+           f"ON CONFLICT(appid,hash_name) DO UPDATE SET {sets},"
+           f" first_ts=COALESCE(quotes.first_ts, excluded.first_ts)")
+    now = int(time.time())
     for r in rows:
-        con.execute(
-            """INSERT OR REPLACE INTO quotes
-               (ts,appid,hash_name,sell_cny,bid_cny,net_cny,volume,
-                src_buy_cny,src_name,ratio)
-               VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (int(r["ts"]), appid, r["hash_name"], r.get("sell_cny"),
-             r.get("bid_cny"), r.get("net_cny"), r.get("volume"),
-             r.get("src_buy_cny"), r.get("src_name"), r.get("ratio")),
-        )
+        hn = r.get("hash_name") or r.get("name") or r.get("n")
+        if not hn:
+            continue
+        r = dict(r)
+        r.setdefault("ts", now)
+        r.setdefault("first_ts", r["ts"])
+        con.execute(sql, [appid, hn] + [r.get(c) for c in QUOTE_COLS])
         n += 1
     con.commit()
     return n
 
 
-def latest_quotes(con, appid: int = 730, within_hours: int = 24,
-                  limit: int = 500) -> list[dict]:
-    """每个物品取最新一条报价，只保留 within_hours 内的。"""
+def latest_quotes(con, appid: int = 730, within_hours: int = 48,
+                  limit: int = 800) -> list[dict]:
+    """按面值比降序取前 N 条。超过 within_hours 没更新的算消失（不导出）。"""
     since = int(time.time()) - within_hours * 3600
     cur = con.execute(
-        """SELECT q.* FROM quotes q
-           JOIN (SELECT hash_name, MAX(ts) AS mx FROM quotes
-                 WHERE appid=? AND ts>=? GROUP BY hash_name) t
-             ON q.hash_name=t.hash_name AND q.ts=t.mx
-           WHERE q.appid=? AND q.ratio IS NOT NULL
-           ORDER BY (q.ratio * COALESCE(q.volume,0)) DESC
-           LIMIT ?""",
-        (appid, since, appid, limit))
+        """SELECT * FROM quotes
+           WHERE appid=? AND ts>=? AND ratio IS NOT NULL
+           ORDER BY ratio DESC LIMIT ?""",
+        (appid, since, limit))
     return [dict(r) for r in cur.fetchall()]
 
-
-def history(con, hash_name: str, appid: int = 730, days: int = 7) -> list[dict]:
-    since = int(time.time()) - days * 86400
-    cur = con.execute(
-        """SELECT ts,sell_cny,bid_cny,net_cny,src_buy_cny,ratio FROM quotes
-           WHERE appid=? AND hash_name=? AND ts>=? ORDER BY ts""",
-        (appid, hash_name, since))
-    return [dict(r) for r in cur.fetchall()]
-
-
-# ---------------- 维护 ----------------
 
 def purge_old(con, keep_days: int = KEEP_DAYS) -> int:
+    """久没更新的物品清掉（下架了、或第三方不再收录）。"""
     cutoff = int(time.time()) - keep_days * 86400
     n = con.execute("DELETE FROM quotes WHERE ts < ?", (cutoff,)).rowcount
     con.commit()
-    if n:
-        con.execute("VACUUM")
-        con.commit()
     return n
 
 
@@ -197,7 +185,6 @@ def stats(con) -> dict:
     q = lambda s: con.execute(s).fetchone()[0]
     return {
         "items": q("SELECT COUNT(*) FROM items"),
-        "items_with_nameid": q("SELECT COUNT(*) FROM items WHERE nameid IS NOT NULL"),
         "quotes": q("SELECT COUNT(*) FROM quotes"),
         "latest_ts": q("SELECT MAX(ts) FROM quotes") or 0,
     }
@@ -207,7 +194,8 @@ if __name__ == "__main__":
     con = connect()
     print("db:", os.path.abspath(DB_PATH))
     print(stats(con))
-    if con.execute("SELECT COUNT(*) FROM quotes").fetchone()[0]:
-        print("\n最新 5 条：")
-        for r in latest_quotes(con, limit=5):
+    rows = latest_quotes(con, limit=5)
+    if rows:
+        print("\n面值比最高的 5 条：")
+        for r in rows:
             print(f"  {r['ratio']:.3f}  {r['hash_name']}")
