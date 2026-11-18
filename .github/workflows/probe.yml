@@ -13,10 +13,9 @@ name: probe
 # 要回答的是：普通箱子 vs 粗排前列的稀有物品，限流是否不同；
 # 以及冷却一分钟后能不能恢复。
 on:
+  # 只留手动触发。原来是 push 到本文件就跑，现在探针已经给出结论，
+  # 再自动跑只会继续往封禁里加请求。
   workflow_dispatch:
-  push:
-    paths:
-      - .github/workflows/probe.yml
 
 permissions:
   contents: write

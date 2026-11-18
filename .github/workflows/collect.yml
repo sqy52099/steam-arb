@@ -21,23 +21,29 @@ on:
   # 2026-11-18 曾经连注释掉过一阵：连续 8 轮物品页全是 429 / HTTP 0、
   # 一件没采到，那时候每 30 分钟重试只是白烧 runner。现在开了回来，
   # 但出口被限流时记得看 Summary —— 连着几轮 ❌ 就说明该换出口了。
-  schedule:
-    - cron: "*/30 * * * *"
+  # 2026-11-18 第二次停掉。这次有实测依据：探针 v4 连打 9 次物品页，
+  # 普通箱子和稀有物品**全部** 429，冷却 60 秒再打还是一样 429，且响应
+  # 时间从 3.8 秒一路涨到 7.6 秒 —— 是限流在持续加深，不是偶发。
+  # 每 30 分钟 4x120 次请求只会让封禁一直续期，先停，等换了出口再开。
+  # 手动 Run workflow 仍然可以跑一轮看情况。
+  # schedule:
+  #   - cron: "*/30 * * * *"
   workflow_dispatch:        # 允许手动点一次，方便第一次验证
     inputs:
       batch:
         description: "每个 shard 采几件（探情况时用小的，20 件约 2 分钟）"
         required: false
         default: "120"
-  push:
-    branches: [main]
-    # 只在动到采集/前端时才跑：改了代码就等于顺手验一次，
-    # 纯文档提交不会白烧一轮 runner。
-    paths:
-      - "collector/**"
-      - "web/**"
-      - "build_site.py"
-      - ".github/workflows/collect.yml"
+  # push 触发也一起停了。原来「改了采集代码就等于顺手验一次」是对的，
+  # 但前提是出口能用；现在每 push 一次就是 4x120 次 429，只会让封禁
+  # 续期。等出口换好再把这四行 paths 放回来。
+  # push:
+  #   branches: [main]
+  #   paths:
+  #     - "collector/**"
+  #     - "web/**"
+  #     - "build_site.py"
+  #     - ".github/workflows/collect.yml"
 
 permissions:
   contents: write
