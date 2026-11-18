@@ -174,7 +174,7 @@ jobs:
           ls -la /tmp/shards || true
           # 折算比标定要问 Steam 的 priceoverview（每样本 2 次请求），
           # 6 个样本 = 12 次，几十秒。
-          python run.py --mode merge --in-dir /tmp/shards --fx-samples 6
+          python run.py --mode merge --in-dir /tmp/shards --fx-samples 6 --est-cap 800
           code=$?
           echo "合并 exit=$code"
           # 退出码留在文件里给汇总那步看。不 exit 1 是为了让后面的
@@ -237,10 +237,15 @@ jobs:
 
           age = (time.time() - d["generated"]) / 60
           print("")
-          print("- 手上 %d 件，折算比 1 USD = ¥%s，数据生成于 %s（%.0f 分钟前）"
-                % (d["count"], d.get("fx") or "—",
+          print("- 手上 %d 件（实测 %d + 估算 %d），折算比 1 USD = ¥%s，"
+                "数据生成于 %s（%.0f 分钟前）"
+                % (d["count"], d.get("real", d["count"]), d.get("est", 0),
+                   d.get("fx") or "—",
                    time.strftime("%Y-%m-%d %H:%M", time.localtime(d["generated"])),
                    age))
+          if d.get("est"):
+              print("- 估算的那 %d 件没有真实盘口，是用第三方中间价折出来的，"
+                    "通常比能卖到的价高 10~20%，别当成真机会。" % d["est"])
           if dead:
               msg = ("%s 失败 —— 多半是 runner 出口被 Steam 拦了，本轮页面数字不变"
                      % "、".join(dead))
@@ -272,9 +277,13 @@ jobs:
               for it in top:
                   # 物品名里几乎都带 " | "（AK-47 | Redline），不转义会把表格列撑破
                   name = (it.get("n") or "").replace("|", "\\|")
+                  if it.get("est"):
+                      name = "〔估〕" + name
+                  depth = it.get("depth")
                   print("| %.3f | %s | ¥%.2f | ¥%.2f | %s |"
                         % (it.get("ratio") or 0, name, it.get("buy") or 0,
-                           it.get("net") or 0, it.get("depth") or 0))
+                           it.get("net") or 0,
+                           depth if depth is not None else "—"))
           PY
           } >> "$GITHUB_STEP_SUMMARY"
 

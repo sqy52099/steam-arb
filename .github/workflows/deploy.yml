@@ -1,0 +1,80 @@
+name: 只发页面
+
+# 采集那条 workflow 死了，页面就永远停在旧版 —— 改个前端也上不去。
+# 这个 workflow 只干一件事：把 data 分支里已有的数据 + 仓库里的 web/
+# 拼成 _site/ 发到 Pages。**完全不碰 Steam**，所以随便跑，不会加重限流。
+#
+# 什么时候用它：
+#   - 只改了 web/ 或 build_site.py
+#   - 采集那边被封，但你已经手动更新过 data 分支的内容
+#
+# 它不会产生新数据，只是把「已经有的数据」配上「新的页面」重新发一遍。
+
+on:
+  workflow_dispatch: {}
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'build_site.py'
+      - '.github/workflows/deploy.yml'
+
+# 只读代码，写 Pages。不需要 contents: write —— 这个 workflow 不推任何分支
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 和采集那条共用同一个 concurrency 组，避免两次部署互相打断
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 取 data 分支的数据
+        env:
+          REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+        run: |
+          set -e
+          # data 分支是 orphan 分支，只放数据文件，没有源码。
+          # 用 depth=1 只取最新那次，别把整个历史拖下来。
+          mkdir -p /tmp/arbdata
+          cd /tmp/arbdata
+          git init -q
+          git remote add origin "$REPO_URL"
+          if git fetch -q --depth=1 origin data 2>/dev/null; then
+            git checkout -q -B data FETCH_HEAD
+            echo "取到 data 分支：$(ls data | tr '\n' ' ')"
+          else
+            echo "::warning::没有 data 分支，页面会因为读不到 latest.json 而显示加载失败"
+            mkdir -p data
+          fi
+
+      - name: 构建静态页
+        env:
+          ARB_DATA: /tmp/arbdata/data
+        run: python build_site.py
+
+      - uses: actions/configure-pages@v5
+        with:
+          enablement: true
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

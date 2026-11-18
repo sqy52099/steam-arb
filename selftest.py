@@ -1029,6 +1029,121 @@ def t_zh_names():
               "缺 %d/%d：%s" % (len(miss), len(items), miss[:5]))
 
 
+def t_est():
+    """估算行：Steam 一件都拿不到时的兜底。
+
+    线上连续十几轮 0 件，页面只能挂旧数字。这条路径最怕的是「估算混进
+    实测」—— 中间价比能卖到的价高 10~20%，当成真机会就会亏钱。所以
+    看见的不只是「有行」，而是每行都带 est=1、bid 是 None、排序在实测之后。
+    """
+    print("\n估算行（没有真实盘口的兜底）")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbest_")
+    old_data = run.DATA
+    run.DATA = tmp
+    shards = os.path.join(tmp, "shards")
+    os.makedirs(shards)
+
+    now = int(time.time())
+    real = [
+        {"n": "Real Thing", "usd_bid": 1000, "usd_sell": 1100,
+         "buy": 90.0, "src": "waxpeer", "qty": 3, "depth": 40,
+         "blevels": 6, "buys": 300, "sells": 90, "ts": now,
+         "mid": 95.0},
+    ]
+    with open(os.path.join(shards, "shard-00.json"), "w",
+              encoding="utf-8") as f:
+        json.dump({"shard": 0, "shards": 1, "round": 9, "ts": now,
+                   "tried": 1, "err": "",
+                   "health": {"steam_orders": {"ok": True, "detail": "1/1"}},
+                   "fx": {"factor": 6.80, "n": 3, "spread": 0.01,
+                          "detail": [], "src": "shard"},
+                   "items": real}, f, ensure_ascii=False)
+
+    # 中间价 ¥20、买入 ¥10：净得 net_from_buyer(20)=17.40，ratio 1.74
+    # 中间价 ¥5、买入 ¥30：ratio 0.14 < MIN_EST，必须被丢掉
+    # 「Real Thing」已经在实测里，不能再出现一遍
+    cand = {
+        "Est Good": {"buy_cny": 10.0, "steam_mid_cny": 20.0,
+                     "src": "skinport", "src_qty": 25},
+        "Est Junk": {"buy_cny": 30.0, "steam_mid_cny": 5.0,
+                     "src": "skinport", "src_qty": 8},
+        "Est No Mid": {"buy_cny": 12.0, "steam_mid_cny": 0,
+                       "src": "waxpeer", "src_qty": 5},
+        "Real Thing": {"buy_cny": 1.0, "steam_mid_cny": 999.0,
+                       "src": "waxpeer", "src_qty": 9},
+    }
+
+    real_factor = steam.market_factor
+
+    def fake_factor(items, min_usd=0.5, max_seconds=90.0):
+        return {"factor": 6.80, "n": 1, "spread": 0.0, "detail": []}
+
+    real_cand = run.fetch_candidates
+    run.fetch_candidates = lambda prefix="": cand
+    steam.market_factor = fake_factor
+    try:
+        args = argparse.Namespace(
+            mode="merge", db=os.path.join(tmp, "e.db"), shard=0, shards=1,
+            batch=1, give_up=25, net_give_up=5, pool_cap=0,
+            out_dir=shards, in_dir=shards, fx_samples=0,
+            export_limit=50, within_hours=48, deadline=0, est_cap=10)
+        run.run_merge(args)
+
+        fp = os.path.join(tmp, "latest.json")
+        with open(fp, encoding="utf-8") as f:
+            d = json.load(f)
+        items = d["items"]
+        est = [it for it in items if it.get("est")]
+        got = [it for it in items if not it.get("est")]
+        check("估算行带 est=1 并能和实测分出来",
+              len(est) == 1 and len(got) == 1, "%d/%d" % (len(est), len(got)))
+        check("export 分开报实测数与估算数",
+              d.get("real") == 1 and d.get("est") == 1
+              and d.get("count") == 2,
+              "%s/%s/%s" % (d.get("real"), d.get("est"), d.get("count")))
+
+        e = est[0] if est else {}
+        check("估算行不编造求购价和盘口",
+              e.get("bid") is None and e.get("depth") is None
+              and e.get("sell_orders") is None,
+              str((e.get("bid"), e.get("depth"), e.get("sell_orders"))))
+        check("估算的面值比 = 中间价净得 ÷ 买入价",
+              e.get("n") == "Est Good"
+              and abs((e.get("ratio") or 0) - 1.74) < 0.01, str(e.get("ratio")))
+        check("估算行拿中间价当卖价",
+              abs((e.get("sell") or 0) - 20.0) < 0.01, str(e.get("sell")))
+        check("比 MIN_EST 还差的估算直接丢",
+              all(it.get("n") != "Est Junk" for it in items))
+        check("没有中间价的估算丢掉",
+              all(it.get("n") != "Est No Mid" for it in items))
+        check("同一件不会既实测又估算",
+              [it.get("n") for it in items].count("Real Thing") == 1)
+        check("实测行 est 是 0", got and got[0].get("est") == 0)
+        check("health 记下了估算这件事",
+              (d.get("health") or {}).get("est", {}).get("ok") is True,
+              str((d.get("health") or {}).get("est")))
+
+        # est_cap 是真的截断，不是只写在帮助文本里
+        cand2 = {"Cap %02d" % i: {"buy_cny": 10.0, "steam_mid_cny": 20.0,
+                                  "src": "skinport", "src_qty": 1}
+                 for i in range(30)}
+        run.fetch_candidates = lambda prefix="": cand2
+        args.est_cap = 12
+        args.db = os.path.join(tmp, "e2.db")
+        run.run_merge(args)
+        with open(fp, encoding="utf-8") as f:
+            d2 = json.load(f)
+        check("est-cap 真的截断了行数",
+              d2.get("est") == 12, str(d2.get("est")))
+    finally:
+        run.fetch_candidates = real_cand
+        steam.market_factor = real_factor
+        run.DATA = old_data
+
+
 def main():
     t_fees()
     t_price()
@@ -1044,6 +1159,7 @@ def main():
     t_fetch_code()
     t_backoff()
     t_fx_reuse()
+    t_est()
     t_zh_names()
     t_pick()
     t_pool_cap()

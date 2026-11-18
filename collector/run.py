@@ -138,6 +138,52 @@ def pick_candidates(cand: dict[str, dict]) -> list[str]:
     return [n for _, n in scored]
 
 
+def build_est_rows(cand: dict[str, dict], real_names: set[str],
+                   cap: int = 800) -> list[dict]:
+    """没有真实盘口的物品，用第三方自报的中间价估一个面值比。
+
+    这是「Steam 完全拿不到」时的兜底，**不能当成真价**：中间价是最近成交
+    价的中位、不是此刻能秒卖的求购价，通常偏高 10~20%；第三方自己也有
+    延迟。所以这些行导出时一律带 est=1，前端单独标成「估」、排在实测行
+    之后 —— 混在一起会让人把估算当成真机会。
+
+    真正的价值在于「有个能看的榜单」：实测只有几十件，而候选池有六千多，
+    估算虽然不准，至少能把明显不划算的排掉。
+    """
+    now = int(time.time())
+    rows = []
+    for name, c in cand.items():
+        if name in real_names:
+            continue
+        buy = c.get("buy_cny") or 0
+        mid = c.get("steam_mid_cny") or 0
+        if buy <= 0 or mid <= 0:
+            continue
+        net = fees.net_from_buyer(mid)
+        ratio = net / buy
+        if ratio < MIN_EST:
+            continue
+        rows.append({
+            "n": name,
+            "sell": round(mid, 2),
+            "bid": None,
+            "net": round(net, 2),
+            "net_sell": round(net, 2),
+            "buy": round(buy, 2),
+            "src": c.get("src"),
+            "qty": c.get("src_qty") or 0,
+            "depth": None,
+            "orders": None,
+            "sell_orders": None,
+            "ratio": round(ratio, 4),
+            "ratio_sell": None,
+            "ts": now,
+            "est": 1,
+        })
+    rows.sort(key=lambda r: -r["ratio"])
+    return rows[:cap]
+
+
 def shard_slice(names: list[str], shard: int, shards: int,
                 batch: int) -> list[str]:
     """按时间算出本轮该采哪一段。
@@ -374,10 +420,26 @@ def run_merge(args) -> None:
     _HEALTH.update(health)
 
     con = connect(args.db)
+
+    # 兜底：Steam 那边一件都拿不到时（出口被限流，线上连续十几轮都是这样），
+    # 页面不能空着。用第三方自报的中间价估一份，导出的每行带 est=1。
+    # 放在 early return 之前算 —— 「没有任何 shard 数据」恰恰是最需要它的场景。
+    est_rows: list[dict] = []
+    if getattr(args, "est_cap", 0) > 0:
+        cand = fetch_candidates("估 ")
+        if cand:
+            real = {it["n"] for it in items}
+            est_rows = build_est_rows(cand, real, args.est_cap)
+            log(f"另用第三方中间价估了 {len(est_rows)} 件"
+                + ("（Steam 那边一件真实盘口都没拿到）" if not items else ""))
+            mark("est", True, f"{len(est_rows)} 件按中间价估，没有真实盘口")
+        else:
+            mark("est", False, "第三方候选也拿不到，只能导出旧数据")
+
     if not items:
         mark("merge", False, "没有任何 shard 数据")
         log("没有可合并的数据，保留旧库")
-        export(args, con)
+        export(args, con, est_rows)
         return
 
     # 折算比：先看采集阶段的 shard 交上来的，不得已才在这里现问。
@@ -534,11 +596,16 @@ def run_merge(args) -> None:
         meta_set(con, "fx_src", fx_info.get("src") or "merge")
     meta_set(con, "fx_note", fx_note)
     log(f"库状态：{stats(con)}")
-    export(args, con)
+    export(args, con, est_rows)
 
 
-def export(args, con) -> None:
-    """给前端用的静态 JSON：只放排序后的前 N 条，控制体积。"""
+def export(args, con, est_rows: list[dict] | None = None) -> None:
+    """给前端用的静态 JSON：只放排序后的前 N 条，控制体积。
+
+    est_rows 是「没查到真实盘口、只能用第三方中间价估」的那些行。它们
+    跟实测行放在同一个 items 里（前端才有东西可看），但每行都带 est=1，
+    前端据此单独标出来、排在实测行后面。
+    """
     rows = latest_quotes(con, appid=APPID, within_hours=args.within_hours,
                          limit=args.export_limit)
 
@@ -569,7 +636,9 @@ def export(args, con) -> None:
         # 和「退回汇率」两种情况——前者差几个点，后者差 6% 且方向危险。
         "fx_note": (meta_get(con, "fx_note") or ""),
         "currency": "CNY",
-        "count": len(rows),
+        "count": len(rows) + len(est_rows or []),
+        "real": len(rows),
+        "est": len(est_rows or []),
         "note": ("ratio = 按 Steam 求购价卖出的净得 ÷ 第三方买入价，1 以上才不亏面值；"
                  "余额折现还要再乘 0.75~0.85。bid/sell 都由盘口美元分按国区折算比换成人民币。"),
         "health": _HEALTH,
@@ -588,7 +657,8 @@ def export(args, con) -> None:
             "ratio": r["ratio"],
             "ratio_sell": r["ratio_sell"],
             "ts": r["ts"],
-        } for r in rows],
+            "est": 0,
+        } for r in rows] + list(est_rows or []),
     }
     os.makedirs(DATA, exist_ok=True)
     fp = os.path.join(DATA, "latest.json")
@@ -596,7 +666,8 @@ def export(args, con) -> None:
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(out, f, ensure_ascii=False, separators=(",", ":"))
     os.replace(tmp, fp)
-    log(f"导出 {fp}（{len(rows)} 条，{os.path.getsize(fp)/1024:.1f} KB）")
+    log(f"导出 {fp}（{len(rows)} 条实测 + {len(est_rows or [])} 条估算，"
+        f"{os.path.getsize(fp)/1024:.1f} KB）")
 
     # 按天历史单独一个文件：只有进「我的库存」页才需要它，
     # 混进 latest.json 会让首屏多下几百 KB，而绝大多数人根本不看那个页签。
@@ -692,8 +763,24 @@ def merge_fake(args) -> None:
     mark("fx", True, "fake")
     mark("merge", True, f"fake {len(rows)} 条")
     meta_set(con, "fx", fx)
-    log(f"[fake] 入库 {len(rows)} 条，历史补了 5 天")
-    export(args, con)
+
+    # 造几条「只有估算、没有真实盘口」的行，离线也能验前端怎么标它们
+    est_rows: list[dict] = []
+    if getattr(args, "est_cap", 0) > 0:
+        fake_rnd = random.Random(7)
+        cand = {}
+        for i in range(12):
+            buy = round(fake_rnd.uniform(4, 300), 2)
+            cand[f"Est Only {i:03d}"] = {
+                "buy_cny": buy,
+                "steam_mid_cny": round(buy * fake_rnd.uniform(1.0, 1.4), 2),
+                "src": "fake-est", "src_qty": fake_rnd.randint(1, 40),
+            }
+        est_rows = build_est_rows(cand, {it["n"] for it in items}, args.est_cap)
+        mark("est", True, f"{len(est_rows)} 件按中间价估（fake）")
+
+    log(f"[fake] 入库 {len(rows)} 条，历史补了 5 天，估算 {len(est_rows)} 条")
+    export(args, con, est_rows)
 
 
 def main() -> None:
@@ -718,6 +805,9 @@ def main() -> None:
                     help="标定折算比用几个样本（每个 2 次请求）")
     ap.add_argument("--export-limit", type=int, default=800)
     ap.add_argument("--within-hours", type=int, default=48)
+    ap.add_argument("--est-cap", type=int, default=800,
+                    help="Steam 拿不到真实盘口时，用第三方中间价估多少件"
+                         "（0 = 关掉估算，只导出实测过的）")
     ap.add_argument("--deadline", type=float, default=0,
                     help="本轮最多干多少分钟，到点自己收工")
     a = ap.parse_args()
