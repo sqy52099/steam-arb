@@ -716,7 +716,18 @@ def t_fx_reuse():
         check("退回汇率时明说后果（涨约 6%）",
               "6%" in (d.get("fx_note") or ""), str(d.get("fx_note")))
 
-        # 第二次：真标出来了 → 记下来
+        # 第二次：还是没标出来。这一步踩的就是线上那个 bug —— 上一轮
+        # 退回汇率时把 7.1 写进了 meta.fx，如果「沿用」读的是 fx，就会
+        # 把汇率当成「上次测到的」，跟直接退回汇率没区别。
+        one_shard({})
+        run.run_merge(args)
+        d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
+        check("没有标定记录时不把汇率当「上次测到的」",
+              d.get("fx") == rate
+              and "一次都没标定成功" in (d.get("fx_note") or ""),
+              "%s / %s" % (d.get("fx"), d.get("fx_note")))
+
+        # 第三次：真标出来了 → 记下来
         one_shard({"factor": 6.73, "n": 4, "spread": 0.01,
                    "detail": [], "src": "shard"})
         run.run_merge(args)
@@ -726,7 +737,7 @@ def t_fx_reuse():
         check("标定成功时不带提示", not (d.get("fx_note") or ""),
               str(d.get("fx_note")))
 
-        # 第三次：又没标出来 → 沿用 6.73，不是汇率
+        # 第四次：又没标出来 → 沿用 6.73，不是汇率
         one_shard({})
         run.run_merge(args)
         d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
@@ -736,6 +747,16 @@ def t_fx_reuse():
               "最近一次" in (d.get("fx_note") or "")
               or "小时前" in (d.get("fx_note") or ""),
               str(d.get("fx_note")))
+
+        # 退回汇率那一轮的 7.1 绝不能污染 fx_cal，否则后面「沿用」就是把
+        # 汇率当成标定值，和直接退回汇率没区别（线上第四轮就是这个 bug）。
+        con = store.connect(args.db)
+        try:
+            check("退回汇率的值没被当成标定值存下来",
+                  abs(float(store.meta_get(con, "fx_cal") or 0) - 6.73) < 0.01,
+                  str(store.meta_get(con, "fx_cal")))
+        finally:
+            con.close()
     finally:
         steam.market_factor = real_factor
         run.DATA = old_data

@@ -358,11 +358,13 @@ def run_merge(args) -> None:
         # 高约 6%，用它算出来的每个数都偏乐观，方向正好是「让你以为更赚」。
         # 先沿上一次真正测到的值：国区定价和汇率的差距变化很慢，昨天的
         # 折算比今天照样能用；沿用的时候说清楚是哪天的，别让人以为是新的。
+        # 必须读 fx_cal（真标出来的值），不能读 fx —— fx 会被退回汇率的值
+        # 覆盖，读它等于把汇率当成「上次测到的」，那和直接退回汇率没区别。
         prev = None
         prev_ts = None
         try:
-            prev = float(meta_get(con, "fx") or 0) or None
-            prev_ts = int(meta_get(con, "fx_ts") or 0) or None
+            prev = float(meta_get(con, "fx_cal") or 0) or None
+            prev_ts = int(meta_get(con, "fx_cal_ts") or 0) or None
         except Exception:
             pass
         if prev:
@@ -456,8 +458,10 @@ def run_merge(args) -> None:
     meta_set(con, "last_merge", int(time.time()))
     meta_set(con, "fx", fx)
     if fx_info.get("factor"):
-        # 只有真标出来的才更新 fx_ts，沿用的旧值不该把自己刷新成「刚测的」
-        meta_set(con, "fx_ts", int(time.time()))
+        # 只有真标出来的才更新 fx_cal，沿用的旧值不该把自己刷新成「刚测的」。
+        # fx 存本轮实际用的值（可能是沿用的），fx_cal 只存标定成功的值。
+        meta_set(con, "fx_cal", fx_info["factor"])
+        meta_set(con, "fx_cal_ts", int(time.time()))
         meta_set(con, "fx_src", fx_info.get("src") or "merge")
     meta_set(con, "fx_note", fx_note)
     log(f"库状态：{stats(con)}")
