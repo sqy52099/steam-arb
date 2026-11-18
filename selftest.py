@@ -602,6 +602,73 @@ def t_sanity():
         run.DATA = old_data
 
 
+def t_shard_fx():
+    """折算比要由采集阶段交上来，因为 merge 只有一个出口 IP。
+
+    线上连着两轮 fx 都标定失败 —— merge 是单独一个 job，撞上 Steam 限流
+    就整轮拿不到，只好退回汇率，所有人民币价偏高约 6%。而每个 collect
+    job 有自己的 IP，让它们各标一份，挑中位数，成功率高得多。
+    """
+    print("\n折算比来自采集阶段")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbfx_")
+    old_data = run.DATA
+    run.DATA = tmp
+    shards = os.path.join(tmp, "shards")
+    os.makedirs(shards)
+
+    now = int(time.time())
+    items = [{"n": "Thing", "usd_bid": 1000, "usd_sell": 1400,
+              "buy": 10.0, "src": "waxpeer", "qty": 5, "depth": 3,
+              "blevels": 2, "buys": 400, "sells": 300, "mid": None,
+              "ts": now}]
+    # 四台各标一次，其中两台被限流没标出来
+    fx_per_shard = [
+        {"factor": 6.72, "n": 3, "spread": 0.01, "detail": []},
+        {"factor": 6.74, "n": 2, "spread": 0.01, "detail": []},
+        {},
+        {},
+    ]
+    for i, fx in enumerate(fx_per_shard):
+        with open(os.path.join(shards, f"shard-{i:02d}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"shard": i, "shards": 4, "round": 11, "ts": now,
+                       "tried": 1, "err": "", "fx": fx,
+                       "health": {"steam_orders": {"ok": True, "detail": "1/1"}},
+                       "items": items if i == 0 else []},
+                      f, ensure_ascii=False)
+
+    real_factor = steam.market_factor
+    asked = []
+
+    def spy(sample, **kw):
+        asked.append(sample)
+        return {"factor": 9.99, "n": 1, "spread": 0.0, "detail": []}
+
+    steam.market_factor = spy
+    try:
+        args = argparse.Namespace(
+            mode="merge", db=os.path.join(tmp, "f.db"), shard=0, shards=4,
+            batch=1, give_up=25, out_dir=shards, in_dir=shards,
+            fx_samples=6, export_limit=50, within_hours=48, deadline=0)
+        run.run_merge(args)
+        d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
+        check("用采集阶段交上来的折算比（两台各标一次取中位数）",
+              d.get("fx") is not None and abs(d["fx"] - 6.73) < 0.02,
+              str(d.get("fx")))
+        check("有 shard 的折算比时就不再当场问 Steam",
+              asked == [], f"问了 {len(asked)} 次")
+        hfx = d["health"].get("fx") or {}
+        check("health 里写明折算比是从哪来的",
+              hfx.get("ok") is True and "shard" in str(hfx.get("detail")),
+              str(hfx.get("detail")))
+    finally:
+        steam.market_factor = real_factor
+        run.DATA = old_data
+
+
 def main():
     t_fees()
     t_price()
@@ -612,6 +679,7 @@ def main():
     t_merge()
     t_merge_real()
     t_sanity()
+    t_shard_fx()
     t_shards()
     t_deadline()
     t_fake()

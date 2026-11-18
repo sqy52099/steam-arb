@@ -212,10 +212,26 @@ def run_collect(args) -> None:
     detail = f"{ok}/{tried} 成功" + (f" · {last_err}" if last_err else "")
     mark("steam_orders", tried > 0, detail)
     log(f"shard{args.shard} 完成：{detail}")
-    _write_shard(args, items, "")
+
+    # 顺手标定一份折算比。merge 是单独一个 job、只有一个出口 IP，撞上
+    # 限流就整轮拿不到折算比 —— 线上连着两轮都是这样，只好退回汇率，
+    # 所有人民币价偏高约 6%。而每个 collect job 有自己的 IP，四个都试
+    # 一遍，总有一个能通。取最接近中位数的那份，各 shard 的结果落在
+    # merge 里再挑。
+    fx_marks = [it["n"] for it in sorted(
+                    [it for it in items if (it.get("usd_sell") or 0) >= 100],
+                    key=lambda x: -(x.get("usd_sell") or 0))][:args.fx_samples]
+    fx_info = {"factor": None, "n": 0}
+    if fx_marks:
+        try:
+            fx_info = st.market_factor(fx_marks, max_seconds=60)
+        except Exception as e:
+            log(f"  折算比标定抛异常：{e}")
+    _write_shard(args, items, "", fx_info)
 
 
-def _write_shard(args, items: list[dict], err: str) -> None:
+def _write_shard(args, items: list[dict], err: str,
+                 fx_info: dict | None = None) -> None:
     d = args.out_dir
     os.makedirs(d, exist_ok=True)
     fp = os.path.join(d, f"shard-{args.shard:02d}.json")
@@ -224,6 +240,7 @@ def _write_shard(args, items: list[dict], err: str) -> None:
         "round": round_index(), "ts": int(time.time()),
         "tried": len(items), "err": err,
         "health": _HEALTH,
+        "fx": fx_info or {},
         "items": items,
     }
     tmp = fp + ".tmp"
@@ -237,10 +254,17 @@ def _write_shard(args, items: list[dict], err: str) -> None:
 
 def load_shards(in_dir: str) -> tuple[list[dict], dict, int]:
     """读回所有 shard。返回 (物品列表, 合并的 health, 本轮 round)。"""
+    items, health, rnd, _ = load_shards_fx(in_dir)
+    return items, health, rnd
+
+
+def load_shards_fx(in_dir: str) -> tuple[list[dict], dict, int, list[dict]]:
+    """同上，另外把各 shard 交上来的折算比样本一并带回来。"""
     files = sorted(glob.glob(os.path.join(in_dir, "shard-*.json")))
     items: list[dict] = []
     health: dict = {}
     rounds: list[int] = []
+    fxinfos: list[dict] = []
     for fp in files:
         try:
             with open(fp, encoding="utf-8") as f:
@@ -251,13 +275,16 @@ def load_shards(in_dir: str) -> tuple[list[dict], dict, int]:
         rows = j.get("items") or []
         items.extend(rows)
         rounds.append(int(j.get("round") or 0))
+        fx = j.get("fx") or {}
+        if fx.get("factor"):
+            fxinfos.append(fx)
         for k, v in (j.get("health") or {}).items():
             # 任何一台机器失败就记失败，不要被后面的成功覆盖
             if k not in health or not health[k].get("ok"):
                 health[k] = v
         log(f"{os.path.basename(fp)}  {len(rows)} 件")
     rnd = max(rounds) if rounds else 0
-    return items, health, rnd
+    return items, health, rnd, fxinfos
 
 
 def book_trusted(sell_cny, mid, sells) -> str:
@@ -281,7 +308,7 @@ def book_trusted(sell_cny, mid, sells) -> str:
 
 def run_merge(args) -> None:
     """把 shard 结果折成人民币、算面值比、写库、导出。"""
-    items, health, rnd = load_shards(args.in_dir)
+    items, health, rnd, shard_fx = load_shards_fx(args.in_dir)
     _HEALTH.update(health)
 
     con = connect(args.db)
@@ -291,16 +318,40 @@ def run_merge(args) -> None:
         export(args, con)
         return
 
-    # 标定折算比：只能在这个阶段做，因为要问 Steam 的 priceoverview。
+    # 折算比：先看采集阶段的 shard 交上来的，不得已才在这里现问。
+    #
+    # 为什么不在 merge 里问：merge 是单独一个 job，只有一个出口 IP，撞上
+    # Steam 限流就整轮拿不到 —— 线上连着两轮都是「标定失败，退回汇率」，
+    # 于是所有人民币价偏高约 6%。而 4 个 collect job 各有自己的 IP，
+    # 让它们顺手各标一份，总数里挑中位数，成功率高得多。
     import steam as st
-    sample = [it["n"] for it in sorted(
-                  [it for it in items if (it.get("usd_sell") or 0) >= 100],
-                  key=lambda x: -(x.get("usd_sell") or 0))][:args.fx_samples]
-    fx_info = st.market_factor(sample) if sample else {"factor": None, "n": 0}
+    fx_info: dict = {}
+    if shard_fx:
+        vals = sorted(float(f["factor"]) for f in shard_fx)
+        fx_info = {
+            "factor": round(vals[len(vals) // 2], 4),
+            "n": sum(int(f.get("n") or 0) for f in shard_fx),
+            "spread": round((vals[-1] - vals[0]) / vals[len(vals) // 2], 4)
+                      if len(vals) > 1 and vals[len(vals) // 2] else None,
+            "src": "shard",
+            "detail": shard_fx,
+        }
+        log(f"折算比取自采集阶段（{len(shard_fx)} 台各标了一次）")
+
     fx = fx_info.get("factor")
+    if not fx and args.fx_samples > 0:
+        sample = [it["n"] for it in sorted(
+                      [it for it in items if (it.get("usd_sell") or 0) >= 100],
+                      key=lambda x: -(x.get("usd_sell") or 0))][:args.fx_samples]
+        fx_info = st.market_factor(sample) if sample else {"factor": None, "n": 0}
+        fx = fx_info.get("factor")
+        if fx:
+            log("采集阶段没给出折算比，这里现问 Steam 才拿到")
+
     if fx:
         mark("fx", True,
-             f"{fx} ×{fx_info['n']} 样本 离散{(fx_info.get('spread') or 0)*100:.2f}%")
+             f"{fx} ×{fx_info['n']} 样本 · 来自{fx_info.get('src') or 'merge'}",
+             )
         log(f"折算比 1 USD = ¥{fx}（{fx_info['n']} 个样本）")
     else:
         # 标定失败就用真实汇率兜底，但必须标出来 —— 这时候数字会偏高。
@@ -470,6 +521,8 @@ def run_fake(args) -> None:
                        "tried": len(items), "err": "",
                        "health": {"thirdparty": {"ok": True, "detail": "fake"},
                                   "steam_orders": {"ok": True, "detail": "fake"}},
+                       "fx": {"factor": 6.80, "n": 5, "spread": 0.01,
+                              "detail": [], "src": "fake"},
                        "items": items}, f, ensure_ascii=False)
     log(f"[fake] 写了 {args.shards} 个 shard 到 {d}")
     # merge 阶段：不联网，折算比用固定值
