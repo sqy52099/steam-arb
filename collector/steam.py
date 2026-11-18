@@ -79,18 +79,26 @@ class ParseError(RuntimeError):
 
 
 class Limiter:
-    """令牌桶 + 429 递增退避。
+    """令牌桶 + 429 短退避。
 
     gap 可用环境变量 STEAM_GAP 覆盖 —— CI 每轮时间预算固定，必须能调。
-    429 不再「连续三次就收工」：实测限流是阵发的，硬退避能等到恢复窗口，
-    收工则白丢那一段（8 分钟压测里恢复期贡献了 41 件）。
+
+    退避策略改过一次，方向正好相反，两次都有实测依据：
+
+    * 早期是「3 + 4*strikes 递增、封顶 45 秒」，理由是等恢复窗口。
+      线上打脸：12 分钟预算里只试到 10 件、全 429。算一下就知道为什么
+      —— 每件撞两次 429、两次退避，累计光睡就 576 秒，剩下的时间不够
+      试第三件。一件都没成功，退避等来的窗口也没用上。
+    * 现在改成「一两秒就走」，把时间换成尝试次数。依据是同期的单发
+      探针：同一个出口、同一时刻，单发物品页能拿 200（544 KB），连打
+      就全 429 —— 限流是窗口式的，撞窗口靠多试，不靠等。
     """
 
     def __init__(self, gap: float | None = None, cap: float | None = None):
         if gap is None:
             gap = _env_float("STEAM_GAP", 2.5)
         if cap is None:
-            cap = _env_float("STEAM_BACKOFF_CAP", 45.0)
+            cap = _env_float("STEAM_BACKOFF_CAP", 6.0)
         self.gap = gap
         self.cap = cap
         self._last = 0.0
@@ -103,9 +111,9 @@ class Limiter:
         self._last = time.monotonic()
 
     def on_429(self):
-        """被限流：睡一会儿，越连续睡越久，但封顶，然后继续试。"""
+        """被限流：短短睡一下就走，别把预算烧在等待上。"""
         self.strikes += 1
-        nap = min(self.cap, 3.0 + 4.0 * self.strikes) + random.random() * 3
+        nap = min(self.cap, 1.0 + 1.0 * self.strikes) + random.random() * 1.5
         time.sleep(nap)
 
     def ok(self):

@@ -1060,7 +1060,8 @@ function renderSpark(){
   const first = series[0], last = series[series.length - 1];
   const pct = first.v ? ((last.v - first.v) / first.v) * 100 : 0;
   const span_days = Math.round((last.ts - first.ts) / 86400) + 1;
-  const src = HISTAPI ? `最近 ${span_days} 天（按天）` : `${series.length} 个记录点`;
+  const src = (HISTAPI && Object.keys(HISTAPI).length)
+    ? `最近 ${span_days} 天（按天）` : `${series.length} 个记录点`;
   $('sparkHd').textContent =
     `组合面值走势　${src}　从 ¥${fmt(first.v)} → ¥${fmt(last.v)}` +
     `（${pct >= 0 ? '+' : ''}${fmt(pct, 1)}%）`;

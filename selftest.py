@@ -921,6 +921,43 @@ def t_fetch_code():
         steam.urllib.request.urlopen = real
 
 
+def t_backoff():
+    """429 退避要封顶在几秒，不能是几十秒。
+
+    线上实测：旧策略（3 + 4*strikes、封顶 45 秒）下，12 分钟预算里光睡就
+    576 秒，只试到 10 件且全 429。压制退避是为了把时间换成尝试次数 ——
+    同期的单发探针能在同一个出口拿到 200，说明限流是窗口式的。
+    """
+    print("\n429 退避的封顶")
+    naps = []
+    real_sleep = steam.time.sleep
+    steam.time.sleep = lambda s: naps.append(s)
+    try:
+        lim = steam.Limiter(gap=0, cap=6.0)
+        for _ in range(30):
+            lim.on_429()
+        top = max(naps)
+        check("连续 30 次 429 的退避也不超过封顶",
+              top <= 6.0 + 1.5 + 1e-6, "%.1f 秒" % top)
+        check("不会再涨到 45 秒那种量级", top < 10, "%.1f 秒" % top)
+        # 30 次全睡满也不过 30*(6+1.5)=225 秒，留得下几十件请求的预算
+        check("30 次退避总耗时还在 12 分钟预算内",
+              sum(naps) < 720, "%.0f 秒" % sum(naps))
+
+        naps.clear()
+        lim2 = steam.Limiter(gap=0, cap=6.0)
+        lim2.on_429()
+        first = naps[0]
+        check("第一次撞 429 只睡一两秒，不立刻躺下",
+              first <= 3.5, "%.1f 秒" % first)
+
+        naps.clear()
+        lim2.ok()
+        check("成功一次就把连续计数清零", lim2.strikes == 0, str(lim2.strikes))
+    finally:
+        steam.time.sleep = real_sleep
+
+
 # ---------------- 中文名查表 ----------------
 
 STAR = "★ "
@@ -1005,6 +1042,7 @@ def main():
     t_shard_fx()
     t_net_give_up()
     t_fetch_code()
+    t_backoff()
     t_fx_reuse()
     t_zh_names()
     t_pick()
