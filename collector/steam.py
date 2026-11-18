@@ -19,6 +19,7 @@ item_nameid 藏在物品页 HTML 的 Market_LoadOrderSpread( 1760231 ) 里，
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import time
@@ -45,9 +46,18 @@ class Challenge(RuntimeError):
 
 
 class Limiter:
-    """令牌桶 + 429 退避。"""
+    """令牌桶 + 429 退避。
 
-    def __init__(self, gap: float = 3.5, max_429: int = 3):
+    gap 可以用环境变量 STEAM_GAP 覆盖 —— CI 每轮只有固定几分钟预算，
+    必须能调，不然请求数一多就撞上 workflow 超时。
+    """
+
+    def __init__(self, gap: float | None = None, max_429: int = 3):
+        if gap is None:
+            try:
+                gap = float(os.environ.get("STEAM_GAP") or 3.5)
+            except ValueError:
+                gap = 3.5
         self.gap = gap
         self.max_429 = max_429
         self._last = 0.0
@@ -127,10 +137,15 @@ def search_page(start: int = 0, count: int = 100, appid: int = APPID) -> dict:
 
 
 def iter_all(appid: int = APPID, count: int = 100, max_pages: int = 250,
-             on_page=None) -> list[dict]:
-    """翻完全量列表。CS2 约 2 万件 → 200 页。max_pages 防止无限跑。"""
+             on_page=None, should_stop=None) -> list[dict]:
+    """翻全量列表。CS2 约 2 万件 → 200 页。max_pages 防止无限跑。
+
+    should_stop 是个回调，返回 True 就提前收工（CI 上用来卡时间预算）。
+    """
     rows, start, pages = [], 0, 0
     while pages < max_pages:
+        if should_stop and should_stop():
+            break
         try:
             j = search_page(start, count, appid)
         except Challenge:

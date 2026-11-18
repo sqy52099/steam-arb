@@ -185,11 +185,51 @@ def t_merge():
     check("is_junk 认 StatTrak", thirdparty.is_junk("StatTrak™ AK-47 | Redline"))
 
 
+def t_schedule():
+    """CI 时间预算 + 轮转游标：这两处错了会静默漏采，必须离线验。"""
+    print("\n调度与游标")
+    import run
+    import time as _t
+
+    run.set_deadline(0.002)          # 0.12 秒
+    a = run.out_of_time()
+    _t.sleep(0.2)
+    b = run.out_of_time()
+    run.set_deadline(0)
+    c = run.out_of_time()
+    check("deadline 到点前不喊停、到点后喊停、关掉不喊停",
+          a is False and b is True and c is False, f"{a},{b},{c}")
+
+    tmp = tempfile.mkdtemp(prefix="arbcur_")
+    con = store.connect(os.path.join(tmp, "c.db"))
+    store.upsert_items(con, [{"hash_name": f"X{i}", "volume": 100,
+                              "nameid": i + 1} for i in range(10)])
+    store.meta_set(con, "rotation_cursor", 0)
+
+    b1 = [x["hash_name"] for x in run.pick_batch(con, 100, 4)]
+    check("取批不推进游标",
+          b1 == ["X0", "X1", "X2", "X3"]
+          and store.meta_get(con, "rotation_cursor") == "0", str(b1))
+
+    run.advance_cursor(con, 100, 2)   # 只采到 2 件
+    b2 = [x["hash_name"] for x in run.pick_batch(con, 100, 4)]
+    check("中断后从没采到的那件接上",
+          b2[0] == "X2", f"得 {b2[0]}，应为 X2")
+
+    store.meta_set(con, "rotation_cursor", 8)
+    run.advance_cursor(con, 100, 4)   # 8+4=12 → 回绕成 2
+    check("游标回绕不越界",
+          store.meta_get(con, "rotation_cursor") == "2",
+          f"得 {store.meta_get(con, 'rotation_cursor')}")
+    con.close()
+
+
 def main():
     t_fees()
     t_steam_parse()
     t_store()
     t_merge()
+    t_schedule()
     print("\n" + "=" * 46)
     print(f"通过 {len(OK)} 项，失败 {len(FAIL)} 项")
     if FAIL:

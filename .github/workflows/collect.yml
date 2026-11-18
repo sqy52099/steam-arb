@@ -10,7 +10,9 @@ name: collect
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # 每 30 分钟一轮。不要改成 */10 —— 一轮实际要跑 15~20 分钟，
+    # 间隔比耗时短的话队列会越堆越多，最后全是排队等超时的废跑。
+    - cron: "*/30 * * * *"
   workflow_dispatch:        # 允许手动点一次，方便第一次验证
 
 permissions:
@@ -60,10 +62,14 @@ jobs:
           ARB_DB: /tmp/arbdata/data/arb.db
           ARB_DATA: /tmp/arbdata/data
           USD_CNY: ${{ vars.USD_CNY }}
+          STEAM_GAP: "3.5"
         run: |
           set +e
           cd collector
-          python run.py --batch 250 --pages 200 --nameid-budget 60
+          # 请求预算：列表 60 页 + 补 30 个 nameid + 查 120 件求购价
+          #   = 210 个请求 × 3.5s ≈ 12 分钟，留出 checkout/push 的余量
+          # --deadline 12：采集自己卡 12 分钟，到点收工，绝不撞 job 的 25 分钟硬超时
+          python run.py --batch 120 --pages 60 --nameid-budget 30 --deadline 12
           rc=$?
           echo "collector exit=$rc"
           # 采集失败也继续：可能已经有部分数据入库，导出旧数据比什么都没有好
@@ -89,17 +95,22 @@ jobs:
             echo "### 采集完成"
             python - <<'PY'
           import json, os, time
-          fp = "/tmp/arbdata/data/latest.json"
+          fp = os.path.join(os.environ.get("DATA_DIR", "/tmp/arbdata"),
+                            "data", "latest.json")
           if not os.path.exists(fp):
-              print("没有产出 latest.json")
+              print("没有产出 latest.json —— 本轮采集可能整体失败")
               raise SystemExit
           d = json.load(open(fp, encoding="utf-8"))
+          age = (time.time() - d["generated"]) / 60
           print(f"- 物品 {d['count']} 件")
-          print(f"- 生成时间 {time.strftime('%Y-%m-%d %H:%M', time.localtime(d['generated']))}")
+          print(f"- 生成于 {time.strftime('%Y-%m-%d %H:%M', time.localtime(d['generated']))}"
+                f"（{age:.0f} 分钟前）")
           top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
-          print("\n| 面值比 | 物品 | 买入 | 净得 | 24h 成交 |")
+          print("")
+          print("| 面值比 | 物品 | 买入 | 净得 | 24h 成交 |")
           print("| --- | --- | --- | --- | --- |")
           for it in top:
-              print(f"| {it['ratio']:.3f} | {it['n']} | ¥{it['buy']:.2f} | ¥{it['net']:.2f} | {it['vol']} |")
+              print(f"| {it['ratio']:.3f} | {it['n']} | ¥{it['buy']:.2f} "
+                    f"| ¥{it['net']:.2f} | {it['vol']} |")
           PY
-          } >> $GITHUB_STEP_SUMMARY
+          } >> "$GITHUB_STEP_SUMMARY"

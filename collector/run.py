@@ -34,6 +34,19 @@ BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.environ.get("ARB_DATA") or os.path.join(BASE, "data")
 APPID = 730
 
+# 本轮采集的硬截止时间点（monotonic）。CI 上超时就整轮白跑，
+# 所以宁可少采一点也要自己先收工，把已经拿到的写回去。
+_DEADLINE = None
+
+
+def set_deadline(minutes: float) -> None:
+    global _DEADLINE
+    _DEADLINE = time.monotonic() + minutes * 60 if minutes > 0 else None
+
+
+def out_of_time() -> bool:
+    return _DEADLINE is not None and time.monotonic() >= _DEADLINE
+
 
 def log(msg):
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -59,15 +72,28 @@ def usd_cny() -> float:
 
 
 def pick_batch(con, pool_size: int, batch: int) -> list[dict]:
-    """按 meta 里的游标轮转取一批，保证每轮打不同的物品。"""
+    """按 meta 里的游标轮转取一批，保证每轮打不同的物品。
+
+    注意：游标不在这里推进 —— 提前收工时可能只采了一半，这时推进整批
+    会让没采到的那部分被跳过。真正的推进在 advance_cursor。
+    """
     rows = candidates(con, appid=APPID, min_volume=30, limit=pool_size)
     if not rows:
         return []
     cursor = int(meta_get(con, "rotation_cursor", 0) or 0)
     cursor %= len(rows)
-    picked = (rows[cursor:] + rows[:cursor])[:batch]
-    meta_set(con, "rotation_cursor", (cursor + batch) % len(rows))
-    return picked
+    return (rows[cursor:] + rows[:cursor])[:batch]
+
+
+def advance_cursor(con, pool_size: int, done: int) -> None:
+    """只推进实际采到的件数，保证一轮被打断也不会漏物品。"""
+    if done <= 0:
+        return
+    rows = candidates(con, appid=APPID, min_volume=30, limit=pool_size)
+    if not rows:
+        return
+    cursor = int(meta_get(con, "rotation_cursor", 0) or 0)
+    meta_set(con, "rotation_cursor", (cursor + done) % len(rows))
 
 
 def pick_need_nameid(con, budget: int) -> list[str]:
@@ -142,7 +168,8 @@ def run_real(args) -> None:
     import steam as st
     try:
         listed = st.iter_all(APPID, count=100, max_pages=args.pages,
-                             on_page=lambda p, n, t: log(f"  列表第 {p} 页 {n}/{t}"))
+                             on_page=lambda p, n, t: log(f"  列表第 {p} 页 {n}/{t}"),
+                             should_stop=out_of_time)
         upsert_items(con, [{"hash_name": r["hash_name"],
                             "volume": r["sell_listings"],
                             "tradable": 1} for r in listed])
@@ -157,6 +184,9 @@ def run_real(args) -> None:
         log(f"补 nameid {len(todo)} 件（每件要抓一次物品页，很贵）")
         ok = 0
         for hn in todo:
+            if out_of_time():
+                log("  时间预算用完，nameid 补到一半停下")
+                break
             try:
                 nid = st.fetch_nameid(hn, APPID)
             except Exception as e:
@@ -171,7 +201,11 @@ def run_real(args) -> None:
     batch = pick_batch(con, args.pool, args.batch)
     log(f"本轮采集 {len(batch)} 件")
     got = 0
+    scanned = 0        # 真正发过请求的件数，游标按它推进
     for it in batch:
+        if out_of_time():
+            log("  时间预算用完，求购价采到一半停下")
+            break
         hn = it["hash_name"]
         nameid = it.get("nameid")
         if not nameid:
@@ -181,6 +215,7 @@ def run_real(args) -> None:
         except Exception as e:
             log(f"  求购价失败 {hn}: {e}")
             break          # 多半是被限流了，本轮收工
+        scanned += 1
         if not hist:
             continue
         b = buy_by_name.get(hn) or {}
@@ -199,7 +234,8 @@ def run_real(args) -> None:
             "ratio": round((net_bid if net_bid else net) / buy_cny, 4)
                      if (buy_cny and (net_bid or net)) else None,
         }])
-    log(f"成功写入 {got} 条")
+    log(f"成功写入 {got} 条（实际请求 {scanned} 件）")
+    advance_cursor(con, args.pool, scanned)
 
     # 4. 维护 + 导出
     n = purge_old(con, 30)
@@ -252,8 +288,12 @@ def main() -> None:
                     help="本轮最多补多少个 nameid（每个要抓一次物品页，很贵）")
     ap.add_argument("--export-limit", type=int, default=500)
     ap.add_argument("--within-hours", type=int, default=48)
+    ap.add_argument("--deadline", type=float, default=0,
+                    help="本轮最多干多少分钟，到点自己收工（CI 上传超时用）")
     ap.add_argument("--fake", action="store_true")
     a = ap.parse_args()
+    if a.deadline > 0:
+        set_deadline(a.deadline)
     if a.fake:
         run_fake(a)
     else:
