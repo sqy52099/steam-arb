@@ -1,0 +1,118 @@
+name: probe
+
+# 临时探针：只为了回答一个问题 —— priceoverview 在 runner 出口上能不能
+# 稳定连打。用完就删。
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/probe.yml
+
+permissions:
+  contents: write
+
+env:
+  OUT_DIR: /tmp/probelog
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 探针
+        env:
+          STEAM_GAP: "2.5"
+        run: |
+          set +e
+          mkdir -p "$OUT_DIR"
+          cd collector
+          python - <<'PY'
+          import json, os, sys, time
+          sys.path.insert(0, os.getcwd())
+          import run, thirdparty, steam as st
+
+          cand = run.fetch_candidates("probe ")
+          if not cand:
+              print("拿不到第三方候选")
+              sys.exit(0)
+          ranked = run.pick_candidates(cand)
+          names = ranked[:45]
+          print("候选 %d，粗排后 %d，测前 %d" % (len(cand), len(ranked), len(names)))
+
+          rows = []
+          ok = n429 = other = 0
+          t0 = time.monotonic()
+          for hn in names:
+              if time.monotonic() - t0 > 420:
+                  print("  时间到，停")
+                  break
+              try:
+                  po = st.price_overview(hn)
+                  if po and po.get("lowest"):
+                      ok += 1
+                      rows.append({"n": hn, "lowest": po["lowest"],
+                                   "median": po.get("median"),
+                                   "vol": po.get("volume")})
+                  else:
+                      other += 1
+              except st.RateLimited:
+                  n429 += 1
+              except Exception:
+                  other += 1
+              if ok >= 30:
+                  break
+
+          el = time.monotonic() - t0
+          rate = (ok / el * 60) if el > 0 else 0
+          summary = "成功 %d · 429 %d · 其他 %d · 耗时 %.0fs · %.1f 件/分" % (
+              ok, n429, other, el, rate)
+          print(summary)
+
+          # 数据质量：拿粗排的预估比率对比真实中间价，看中间价靠不靠谱
+          detail = []
+          for r in rows[:12]:
+              c = cand.get(r["n"]) or {}
+              buy = c.get("buy_cny") or 0
+              mid = r.get("median") or r.get("lowest") or 0
+              est = run.est_ratio(c) if c else None
+              real = None
+              if buy > 0 and mid > 0:
+                  real = run.fees.net_from_buyer(mid) / buy
+              detail.append({"n": r["n"], "buy": buy,
+                             "po_mid": mid, "po_low": r.get("lowest"),
+                             "vol": r.get("vol"),
+                             "src_mid": c.get("steam_mid_cny"),
+                             "est": est, "real": real})
+              print("  %-42s buy %8.2f po_mid %9.2f src_mid %9s est %s real %s" % (
+                  r["n"][:42], buy, mid, c.get("steam_mid_cny"),
+                  ("%.3f" % est) if est else "-",
+                  ("%.3f" % real) if real else "-"))
+
+          out = {"summary": summary, "ok": ok, "n429": n429,
+                 "other": other, "seconds": round(el, 1),
+                 "rate_per_min": round(rate, 1), "rows": detail}
+          fp = os.path.join(os.environ.get("OUT_DIR", "/tmp/probelog"), "probe.json")
+          with open(fp, "w", encoding="utf-8") as f:
+              json.dump(out, f, ensure_ascii=False, indent=1)
+          print("写了", fp)
+          PY
+
+      - name: 推结果
+        run: |
+          set -e
+          cd "$OUT_DIR"
+          git init -q
+          git config user.name probe
+          git config user.email probe@local
+          git checkout -q -b probe-log
+          cp probe.json .
+          git add -A
+          git commit -q -m "probe $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
+          git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+          git push -q -f origin probe-log
