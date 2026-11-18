@@ -1,9 +1,8 @@
 name: probe
 
-# 临时探针 v2，回答两个问题：
-#   1. priceoverview 到底怎么失败的（超时？403？还是别的）
-#   2. 非 Azure 出口（公共代理）能不能拿到 Steam 数据
-# 用完就删。
+# 临时探针 v3：物品页在「大间隔」下能不能稳定拿到。
+# 已知：单发物品页 200（544KB），连打 2.5 秒间隔全 429。
+# 那就量一下间隔和成功率的关系，好定 STEAM_GAP。
 on:
   workflow_dispatch:
   push:
@@ -19,7 +18,7 @@ env:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -33,90 +32,58 @@ jobs:
           mkdir -p "$OUT_DIR"
           cd collector
           python - <<'PY'
-          import json, os, socket, sys, time, urllib.error, urllib.parse, urllib.request
+          import json, os, sys, time
           sys.path.insert(0, os.getcwd())
-          import run
+          import run, steam as st
 
-          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-          out = {}
+          cand = run.fetch_candidates("probe ")
+          ranked = run.pick_candidates(cand) if cand else []
+          print("候选 %d，粗排后 %d" % (len(cand or {}), len(ranked)))
+          if not ranked:
+              sys.exit(0)
 
-          # ---------- 1. 直连 Steam，看具体错误 ----------
-          def probe(url, timeout=12):
-              req = urllib.request.Request(url, headers={
-                  "User-Agent": UA,
-                  "Accept": "application/json, text/plain, */*",
-                  "Accept-Language": "zh-CN,zh;q=0.9",
-              })
+          # 每种间隔试 6 件，从池子里挑不同物品避免重复命中缓存
+          # 第四组先干等 90 秒再按 2.5 秒间隔打 3 件，用来分辨限流是
+          # 「按速率算」还是「窗口式」：前者冷却后仍然会撞，后者冷却后能过。
+          plans = [(2.5, 6, 0), (8.0, 6, 0), (15.0, 6, 0), (2.5, 3, 90)]
+          results = []
+          idx = 0
+          for gap, n, cool in plans:
+              if cool:
+                  print("  冷却 %d 秒…" % cool)
+                  time.sleep(cool)
+              st.LIMITER.gap = gap
+              st.LIMITER.strikes = 0
+              ok = bad = 0
+              errs = []
               t0 = time.monotonic()
-              try:
-                  with urllib.request.urlopen(req, timeout=timeout) as r:
-                      body = r.read()
-                      return {"code": r.status, "ms": round((time.monotonic()-t0)*1000),
-                              "bytes": len(body), "head": body[:120].decode("utf-8","replace")}
-              except urllib.error.HTTPError as e:
-                  return {"code": e.code, "ms": round((time.monotonic()-t0)*1000),
-                          "err": "HTTPError", "head": (e.read()[:120] or b"").decode("utf-8","replace")}
-              except Exception as e:
-                  return {"code": 0, "ms": round((time.monotonic()-t0)*1000),
-                          "err": type(e).__name__, "head": str(e)[:120]}
+              for _ in range(n):
+                  if idx >= len(ranked):
+                      break
+                  hn = ranked[idx]; idx += 1
+                  try:
+                      ob = st.item_orderbook(hn)
+                      ok += 1
+                      print("  gap=%.1f  %-40s OK  bid=%s sell=%s" % (
+                          gap, hn[:40], ob["usd_bid"], ob["usd_sell"]))
+                  except Exception as e:
+                      bad += 1
+                      errs.append(type(e).__name__ + ":" + str(e)[:40])
+                      print("  gap=%.1f  %-40s %s" % (gap, hn[:40], type(e).__name__))
+              el = time.monotonic() - t0
+              row = {"gap": gap, "ok": ok, "bad": bad, "cool": cool,
+                     "seconds": round(el, 1),
+                     "rate": round(ok / el * 60, 1) if el > 0 else 0,
+                     "errs": errs[:4]}
+              results.append(row)
+              print("  → gap=%.1f cool=%d 成功 %d/%d  %.0fs  %.1f 件/分" % (
+                  gap, cool, ok, n, el, row["rate"]))
 
-          po_url = ("https://steamcommunity.com/market/priceoverview/"
-                    "?appid=730&currency=23&market_hash_name=" +
-                    urllib.parse.quote("Prisma Case"))
-          item_url = ("https://steamcommunity.com/market/listings/730/" +
-                      urllib.parse.quote("Prisma Case"))
-
-          direct = {}
-          for tag, u in (("priceoverview", po_url), ("itempage", item_url)):
-              r = probe(u)
-              direct[tag] = r
-              print("直连 %-14s code=%s %sms %s" % (tag, r["code"], r["ms"], r.get("err","")))
-          out["direct"] = direct
-
-          # ---------- 2. 出口 IP 是谁 ----------
-          for tag, u in (("ip", "https://api.ipify.org?format=json"),
-                         ("cf", "https://www.cloudflare.com/cdn-cgi/trace")):
-              r = probe(u, timeout=10)
-              print("出口 %-4s code=%s %s" % (tag, r["code"], (r.get("head") or "")[:90]))
-              out.setdefault("egress", {})[tag] = r
-
-          # ---------- 3. 公共代理能不能拿到 Steam ----------
-          # 这些跑在 AWS / Vercel / 别的云上，出口和 Azure 完全不同。
-          # 只用来回答「换出口有没有用」，不是要拿它们做生产。
-          enc_item = urllib.parse.quote(item_url, safe="")
-          enc_po = urllib.parse.quote(po_url, safe="")
-          proxies = [
-              ("allorigins-po", "https://api.allorigins.win/raw?url=" + enc_po),
-              ("allorigins-item", "https://api.allorigins.win/raw?url=" + enc_item),
-              ("codetabs-po", "https://api.codetabs.com/v1/proxy?quest=" + enc_po),
-              ("codetabs-item", "https://api.codetabs.com/v1/proxy?quest=" + enc_item),
-              ("corsproxy-po", "https://corsproxy.io/?url=" + enc_po),
-          ]
-          pres = {}
-          for tag, u in proxies:
-              r = probe(u, timeout=25)
-              ok = ""
-              h = r.get("head") or ""
-              if '"success"' in h or "lowest_price" in h:
-                  ok = " ★拿到价格"
-              elif "amtMaxBuyOrder" in h:
-                  ok = " ★拿到盘口"
-              print("代理 %-16s code=%s %sms%s" % (tag, r["code"], r["ms"], ok))
-              pres[tag] = r
-          out["proxies"] = pres
-
-          # ---------- 4. 汇总 ----------
-          good = [k for k, v in pres.items() if v.get("code") == 200]
-          out["summary"] = {
-              "direct_po_code": direct["priceoverview"]["code"],
-              "direct_item_code": direct["itempage"]["code"],
-              "proxy_ok": good,
-          }
-          print("\n直连 priceoverview:", direct["priceoverview"]["code"],
-                "| 物品页:", direct["itempage"]["code"],
-                "| 代理可用:", good or "无")
-
+          out = {"results": results,
+                 "summary": "; ".join("gap%.1f/cool%d: %d/%d" % (
+                     r["gap"], r["cool"], r["ok"], r["ok"] + r["bad"])
+                     for r in results)}
+          print("\n" + out["summary"])
           fp = os.path.join(os.environ.get("OUT_DIR", "/tmp/probelog"), "probe.json")
           with open(fp, "w", encoding="utf-8") as f:
               json.dump(out, f, ensure_ascii=False, indent=1)
@@ -132,6 +99,6 @@ jobs:
           git config user.email probe@local
           git checkout -q -b probe-log
           git add -A
-          git commit -q -m "probe v2 $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
+          git commit -q -m "probe v3 $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push -q -f origin probe-log
