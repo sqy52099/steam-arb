@@ -1,7 +1,8 @@
 name: probe
 
-# round 7：把物品页内嵌的 orderbook（TanStack Query 脱水状态）结构挖出来，
-# 顺便测 priceoverview 的 429 多久恢复。用完即删。
+# round 8：round 7 搜错字符串（页面里是 \"market\",\"orderbook\" 转义形式）。
+# 这次反转义后正确抠出 orderbook 的 JSON，并验证 /market/search 页面
+# 是否也内嵌物品列表。用完即删。
 on:
   workflow_dispatch:
   push:
@@ -31,13 +32,6 @@ jobs:
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-          HDR = {
-              "User-Agent": UA,
-              "Accept": "application/json, text/plain, */*",
-              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-              "X-Requested-With": "XMLHttpRequest",
-              "Referer": BASE + "/market/",
-          }
           HTML_HDR = {
               "User-Agent": UA,
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -66,6 +60,37 @@ jobs:
                   return None, str(e).encode(), time.time() - t0
 
 
+          def unescape(t):
+              return t.replace("\\\\", "\\").replace('\\"', '"')
+
+
+          def balanced(s, start):
+              """从 s[start] 的 { 或 [ 开始，返回配对结束位置（含）。"""
+              open_ch = s[start]
+              close_ch = "}" if open_ch == "{" else "]"
+              depth, i, in_str, esc = 0, start, False, False
+              while i < len(s):
+                  c = s[i]
+                  if in_str:
+                      if esc:
+                          esc = False
+                      elif c == "\\":
+                          esc = True
+                      elif c == '"':
+                          in_str = False
+                  else:
+                      if c == '"':
+                          in_str = True
+                      elif c == open_ch:
+                          depth += 1
+                      elif c == close_ch:
+                          depth -= 1
+                          if depth == 0:
+                              return i + 1
+                  i += 1
+              return -1
+
+
           print("=== 出口 IP ===")
           try:
               with urllib.request.urlopen("https://api.ipify.org", timeout=15) as r:
@@ -74,50 +99,78 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          NAME = "Prisma Case"
-          st, raw, dt = fetch(
-              BASE + "/market/listings/730/" + urllib.parse.quote(NAME), HTML_HDR)
-          text = raw.decode("utf-8", "replace")
-          print("物品页 HTTP %s %dB %.1fs" % (st, len(raw), dt))
+          # ---------- A. 物品页 orderbook ----------
+          print("=== A. 物品页内嵌 orderbook ===")
+          for NAME in ["Prisma Case", "Fracture Case", "Kilowatt Case"]:
+              st, raw, dt = fetch(
+                  BASE + "/market/listings/730/" + urllib.parse.quote(NAME),
+                  HTML_HDR)
+              text = unescape(raw.decode("utf-8", "replace"))
+              key = '"queryKey":["market","orderbook",730,"%s"]' % NAME
+              i = text.find(key)
+              print("")
+              print("[%s] HTTP %s %dB  标记 %s" %
+                    (NAME, st, len(raw), "找到" if i >= 0 else "没找到"))
+              if i < 0:
+                  # 退一步：只找 orderbook
+                  j = text.find("orderbook")
+                  print("  裸 orderbook 位置: %d" % j)
+                  if j >= 0:
+                      print("  上下文: %s" % text[max(0, j - 200):j + 300])
+                  time.sleep(2)
+                  continue
+              d = text.find('"data":', i)
+              if d < 0:
+                  print("  标记后没有 data")
+                  time.sleep(2)
+                  continue
+              b = text.find("{", d)
+              end = balanced(text, b)
+              blob = text[b:end]
+              print("  data 长度 %d" % len(blob))
+              try:
+                  j = json.loads(blob)
+                  print("  键: %s" % sorted(j.keys()))
+                  for k in ("appid", "classid", "instanceid",
+                            "buy_order_graph", "sell_order_graph",
+                            "highest_buy_order", "lowest_sell_order",
+                            "buy_order_count", "sell_order_count",
+                            "buy_orders", "sell_orders", "orders"):
+                      if k in j:
+                          v = j[k]
+                          print("  %-20s = %s" % (k, str(v)[:200]))
+                  print("  完整 JSON 前 900 字符:")
+                  print("  %s" % blob[:900])
+              except Exception as e:
+                  print("  json 解析失败: %s" % e)
+                  print("  原始前 600: %s" % blob[:600])
+              time.sleep(2)
           print("")
 
-          # 定位 orderbook 那段 dehydrated state，把它周围的 JSON 抠出来
-          idx = text.find('"market","orderbook"')
-          print("orderbook 标记位置: %d / %d" % (idx, len(text)))
-          if idx < 0:
-              print("没找到，收工")
-              raise SystemExit
-
-          # 向前找 state 起点，向后找结束
-          seg = text[max(0, idx - 3000):idx + 12000]
-          # 反转义：这是嵌在 JSON 字符串里的，有 \" 转义
-          un = seg.replace('\\"', '"').replace("\\\\", "\\")
-          print("")
-          print("=== 反转义后 orderbook 附近 3000 字符 ===")
-          print(un[:3000])
-          print("")
-          print("=== 其中 data 之后的 2500 字符 ===")
-          di = un.find('"data"')
-          print(un[di:di + 2500] if di >= 0 else "(没找到 data)")
-          print("")
-
-          # 直接找所有 queryKey，看看页面一共预取了多少接口
-          print("=== 页面预取的所有 queryKey ===")
-          keys = re.findall(r'\\?"queryKey\\?"\s*:\s*(\[[^\]]{0,120}\])', text)
-          for k in keys[:20]:
-              print("  %s" % k.replace('\\"', '"'))
-          print("")
-
-          # priceoverview 429 恢复测试
-          print("=== priceoverview 429 后恢复测试 ===")
-          for wait in (0, 30, 60):
-              if wait:
-                  print("  等 %d 秒..." % wait)
-                  time.sleep(wait)
-              q = urllib.parse.urlencode({"appid": 730, "currency": 23,
-                                          "market_hash_name": NAME})
-              s2, r2, d2 = fetch(BASE + "/market/priceoverview/?" + q, HDR)
-              print("  等%2ds 后 → HTTP %s %r" % (wait, s2, r2[:80]))
+          # ---------- B. /market/search 页面是否内嵌列表 ----------
+          print("=== B. /market/search 页面（HTML） ===")
+          for label, u in [
+              ("search appid=730",
+               BASE + "/market/search?appid=730&norender=1"),
+              ("search 无参数", BASE + "/market/search"),
+          ]:
+              st, raw, dt = fetch(u, HTML_HDR)
+              text = unescape(raw.decode("utf-8", "replace"))
+              print("")
+              print("[%s] HTTP %s %dB %.1fs" % (label, st, len(raw), dt))
+              print("  含 'hash_name': %d" % text.count("hash_name"))
+              print("  含 'sell_price': %d" % text.count("sell_price"))
+              print("  含 'sell_listings': %d" % text.count("sell_listings"))
+              print("  含 'total_count': %d" % text.count("total_count"))
+              for kw in ("queryKey", "dehydrated", "results"):
+                  print("  含 %-12s: %d" % (kw, text.count(kw)))
+              keys = re.findall(r'"queryKey":(\[[^\]]{0,100}\])', text)
+              for k in keys[:10]:
+                  print("    %s" % k)
+              m = re.search(r'"hash_name":\s*"([^"]{1,60})"', text)
+              if m:
+                  print("  首个 hash_name: %s" % m.group(1))
+              time.sleep(2)
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -132,5 +185,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r7: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r8: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
