@@ -1,6 +1,6 @@
 name: probe
 
-# 一次性诊断：确认 Azure runner 的出口能不能访问 Steam 社区市场。
+# 一次性诊断：确认 runner 出口到底能用哪几个 Steam 接口、能跑多快。
 # 结果写进 probe-log 分支（API 读不到 job 日志，只能走仓库）。
 # 用完即删，不要留在仓库里。
 on:
@@ -12,6 +12,7 @@ on:
 
 permissions:
   contents: write
+  pages: write
 
 env:
   OUT_DIR: /tmp/probelog
@@ -19,50 +20,45 @@ env:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 12
     steps:
       - name: 探针
         run: |
           set -e
           mkdir -p "$OUT_DIR"
           python - <<'PY' > "$OUT_DIR/probe.txt" 2>&1
-          import http.cookiejar, json, re, time
+          import http.cookiejar, json, time
           import urllib.error, urllib.parse, urllib.request
 
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-          JSON_HDR = {
+          HDR = {
               "User-Agent": UA,
               "Accept": "application/json, text/plain, */*",
               "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
               "X-Requested-With": "XMLHttpRequest",
               "Referer": BASE + "/market/",
           }
-          ITEM = "Prisma Case"
+          ITEMS = ["Prisma Case", "Dreams & Nightmares Case",
+                   "Fracture Case", "Recoil Case", "Revolution Case"]
+
+          jar = http.cookiejar.CookieJar()
+          OP = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(jar))
 
 
-          def hit(label, url, headers=None, opener=None, timeout=25):
-              req = urllib.request.Request(url, headers=headers or {})
-              op = opener or urllib.request.build_opener()
+          def get(url, timeout=25):
+              req = urllib.request.Request(url, headers=HDR)
               t0 = time.time()
               try:
-                  with op.open(req, timeout=timeout) as r:
+                  with OP.open(req, timeout=timeout) as r:
                       raw = r.read()
-                      print("%-34s HTTP %s  %dB  %.1fs" %
-                            (label, r.status, len(raw), time.time() - t0))
-                      print("    %r" % raw[:260])
-                      return r.status, raw
+                      return r.status, raw, time.time() - t0
               except urllib.error.HTTPError as e:
-                  body = e.read()[:300]
-                  print("%-34s HTTP %s  %.1fs  retry-after=%s" %
-                        (label, e.code, time.time() - t0,
-                         e.headers.get("Retry-After")))
-                  print("    %r" % body)
-                  return e.code, body
+                  return e.code, e.read()[:300], time.time() - t0
               except Exception as e:
-                  print("%-34s 异常 %s: %s" % (label, type(e).__name__, e))
-                  return None, b""
+                  return None, str(e).encode(), time.time() - t0
 
 
           print("=== 出口 IP ===")
@@ -73,52 +69,105 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          # 1. 先取 cookie（很多 429 其实是没有会话）
-          jar = http.cookiejar.CookieJar()
-          op_jar = urllib.request.build_opener(
-              urllib.request.HTTPCookieProcessor(jar))
-          hit("1 市场首页(取 cookie)", BASE + "/market/",
-              {"User-Agent": UA}, op_jar)
-          print("    cookies: %s" % [c.name for c in jar])
+          # 取 cookie
+          get(BASE + "/market/")
+          print("cookies: %s" % [c.name for c in jar])
           print("")
 
-          q = urllib.parse.urlencode({
+          # ---- A. priceoverview 的吞吐 ----
+          print("=== A. priceoverview 连续 15 次（间隔 1.5s） ===")
+          ok = 0
+          for i in range(15):
+              name = ITEMS[i % len(ITEMS)]
+              q = urllib.parse.urlencode({
+                  "appid": 730, "currency": 23, "market_hash_name": name})
+              st, raw, dt = get(BASE + "/market/priceoverview/?" + q)
+              if st == 200:
+                  ok += 1
+                  if i < 3:
+                      print("  #%02d %-30s %s" % (i, name, raw[:120]))
+              else:
+                  print("  #%02d HTTP %s %s" % (i, st, raw[:80]))
+              time.sleep(1.5)
+          print("  → 成功 %d/15" % ok)
+          print("")
+
+          # ---- B. 各接口可达性矩阵 ----
+          print("=== B. 接口矩阵 ===")
+          sq = urllib.parse.urlencode({
               "appid": 730, "norender": 1, "count": 10, "start": 0,
               "sort_column": "popular", "sort_dir": "desc",
-              "currency": 23, "country": "CN",
-          })
-          search = BASE + "/market/search/render/?" + q
-
-          hit("2 search(带 cookie)", search, JSON_HDR, op_jar)
-          time.sleep(3)
-          hit("3 search(裸 urllib)", search)
-          time.sleep(3)
-          hit("4 search(全套头无 cookie)", search, JSON_HDR)
-          time.sleep(3)
-
-          # 5. 换个更轻的接口确认账号级可达性
-          pq = urllib.parse.urlencode({
-              "appid": 730, "currency": 23, "market_hash_name": ITEM})
-          hit("5 priceoverview", BASE + "/market/priceoverview/?" + pq,
-              JSON_HDR, op_jar)
-          time.sleep(3)
-
-          # 6. 物品页拿 nameid
-          st, raw = hit("6 物品页(找 nameid)",
-                        BASE + "/market/listings/730/" + urllib.parse.quote(ITEM),
-                        {"User-Agent": UA}, op_jar)
-          text = raw.decode("utf-8", "replace")
-          m = re.search(r"Market_LoadOrderSpread\(\s*(\d+)\s*\)", text)
-          print("    nameid = %s" % (m.group(1) if m else "没找到"))
-          if m:
+              "currency": 23, "country": "CN"})
+          cases = [
+              ("search/render (730)",
+               BASE + "/market/search/render/?" + sq),
+              ("search/render count=1",
+               BASE + "/market/search/render/?" + urllib.parse.urlencode({
+                   "appid": 730, "norender": 1, "count": 1,
+                   "currency": 23, "country": "CN"})),
+              ("search/render (753 卡牌)",
+               BASE + "/market/search/render/?" + urllib.parse.urlencode({
+                   "appid": 753, "norender": 1, "count": 10,
+                   "currency": 23, "country": "CN"})),
+              ("search 页面(非 render)",
+               BASE + "/market/search?appid=730&norender=1"),
+              # 假 nameid：能回 200/400 就说明接口可达，只是缺 nameid
+              ("itemordershistogram(假 nameid)",
+               BASE + "/market/itemordershistogram/?" + urllib.parse.urlencode({
+                   "norender": 1, "country": "CN", "language": "zh",
+                   "currency": 23, "item_nameid": 999999999})),
+              ("物品页",
+               BASE + "/market/listings/730/Prisma%20Case"),
+              ("单个物品 render",
+               BASE + "/market/listings/730/Prisma%20Case/render/?" +
+               urllib.parse.urlencode({"query": "", "start": 0, "count": 5,
+                                       "country": "CN", "language": "zh",
+                                       "currency": 23})),
+              ("市场首页",
+               BASE + "/market/"),
+          ]
+          for label, url in cases:
+              st, raw, dt = get(url)
+              head = raw[:110]
+              print("  %-32s HTTP %-4s %5.1fs  %r" % (label, st, dt, head))
               time.sleep(3)
-              hq = urllib.parse.urlencode({
-                  "norender": 1, "country": "CN", "language": "zh",
-                  "currency": 23, "item_nameid": m.group(1)})
-              hit("7 itemordershistogram",
-                  BASE + "/market/itemordershistogram/?" + hq, JSON_HDR, op_jar)
+          print("")
+
+          # ---- C. 等 60 秒再打一次，看 429 是不是随时间恢复 ----
+          print("=== C. 冷却 60 秒后重试 ===")
+          time.sleep(60)
+          for label, url in [
+                  ("search/render", BASE + "/market/search/render/?" + sq),
+                  ("物品页", BASE + "/market/listings/730/Prisma%20Case")]:
+              st, raw, dt = get(url)
+              print("  %-16s HTTP %-4s %5.1fs" % (label, st, dt))
+              time.sleep(3)
           PY
           cat "$OUT_DIR/probe.txt"
+
+      - name: Pages 诊断
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo ""
+            echo "=== Pages 站点状态 ==="
+            curl -s -o /tmp/pg.json -w "GET /pages → %{http_code}\n" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pages"
+            cat /tmp/pg.json
+            echo ""
+            echo "=== 尝试创建（build_type=workflow） ==="
+            curl -s -o /tmp/pgc.json -w "POST /pages → %{http_code}\n" \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${{ github.repository }}/pages" \
+              -d '{"build_type":"workflow"}'
+            cat /tmp/pgc.json
+          } >> "$OUT_DIR/probe.txt"
 
       - name: 推结果到 probe-log 分支
         run: |
@@ -130,7 +179,6 @@ jobs:
           git remote add origin \
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
-          cp probe.txt probe.txt.bak
           git add probe.txt
           git commit -q -m "probe: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
