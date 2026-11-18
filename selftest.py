@@ -385,6 +385,101 @@ def t_fake():
         run.DATA = old
 
 
+# ---------------- 真实 merge 路径 ----------------
+
+def t_merge_real():
+    """run_merge 是线上真正跑的那个函数，而 t_fake 走的是 merge_fake。
+
+    这条路径出过一次线上事故：折算比抽样那行把 lambda 的参数 x 用到了
+    列表推导的条件里，语法合法、只在运行到才 NameError，结果 4 个 shard
+    采到的数据全丢了、页面上还是旧数字。所以必须真跑一遍，并且把
+    priceoverview 换成假的（本机连不上 Steam）。
+    """
+    print("\\n真实 merge 路径")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbmerge_")
+    old_data = run.DATA
+    run.DATA = tmp
+    shards = os.path.join(tmp, "shards")
+    os.makedirs(shards)
+
+    now = int(time.time())
+    rows = [
+        {"n": "Cheap Thing", "usd_bid": 50, "usd_sell": 60,
+         "buy": 1.0, "src": "waxpeer", "qty": 10, "depth": 5,
+         "blevels": 3, "buys": 100, "sells": 20, "ts": now},
+        {"n": "Pricey Thing", "usd_bid": 1200, "usd_sell": 1500,
+         "buy": 100.0, "src": "skinport", "qty": 4, "depth": 30,
+         "blevels": 7, "buys": 900, "sells": 80, "ts": now},
+        {"n": "No Bid", "usd_bid": 0, "usd_sell": 300,
+         "buy": 20.0, "src": "waxpeer", "qty": 2, "depth": 0,
+         "blevels": 0, "buys": 0, "sells": 5, "ts": now},
+    ]
+    for s in range(2):
+        with open(os.path.join(shards, f"shard-{s:02d}.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"shard": s, "shards": 2, "round": 7, "ts": now,
+                       "tried": len(rows) // 2, "err": "",
+                       "health": {"steam_orders": {"ok": True,
+                                                   "detail": "2/2"}},
+                       "items": rows[s::2]}, f, ensure_ascii=False)
+
+    real_factor = steam.market_factor
+    asked = []
+
+    def fake_factor(items, min_usd=0.5):
+        asked.extend(items)
+        return {"factor": 6.80, "n": len(items), "spread": 0.01, "detail": []}
+
+    steam.market_factor = fake_factor
+    try:
+        args = argparse.Namespace(
+            mode="merge", db=os.path.join(tmp, "m.db"), shard=0, shards=2,
+            batch=2, give_up=25, out_dir=shards, in_dir=shards,
+            fx_samples=2, export_limit=50, within_hours=48, deadline=0)
+        run.run_merge(args)                       # 这里崩，线上就全丢
+
+        fp = os.path.join(tmp, "latest.json")
+        check("真跑 run_merge 不抛异常", os.path.isfile(fp), "没产出 latest.json")
+        with open(fp, encoding="utf-8") as f:
+            d = json.load(f)
+        check("折算比用标定值而不是汇率", d.get("fx") == 6.80, str(d.get("fx")))
+        check("只把够贵的送去标定（$0.5 以下放大误差）",
+              asked == ["Pricey Thing"]
+              or (len(asked) == 2 and "Cheap Thing" not in asked), str(asked))
+
+        by = {it["n"]: it for it in d["items"]}
+        check("没有求购价的物品被跳过", "No Bid" not in by, str(sorted(by)))
+        p = by.get("Pricey Thing") or {}
+        # $1200/100 × 6.80 = ¥81.60 → 扣 15% 手续费
+        check("美元分按标定比折成人民币",
+              abs((p.get("bid") or 0) - 81.60) < 0.01, str(p.get("bid")))
+        check("净得走了阶梯手续费不是直接 ×0.85",
+              abs((p.get("net") or 0) - 70.99) < 0.02, str(p.get("net")))
+        check("面值比 = 净得 ÷ 买入价",
+              abs((p.get("ratio") or 0) - 0.7099) < 0.001, str(p.get("ratio")))
+        check("挂单价比求购价高，面值比也更大",
+              (p.get("sell") or 0) > (p.get("bid") or 0)
+              and (p.get("ratio_sell") or 0) > (p.get("ratio") or 0),
+              f"{p.get('sell')} vs {p.get('bid')}")
+
+        con = store.connect(args.db)
+        n = con.execute("select count(*) from quotes").fetchone()[0]
+        check("只入库有求购价的 2 件", n == 2, str(n))
+        con.close()
+
+        run.run_merge(args)                       # 再跑一次，验幂等
+        con = store.connect(args.db)
+        n2 = con.execute("select count(*) from quotes").fetchone()[0]
+        check("重复 merge 不产生重复行（快照表按物品覆盖）", n2 == 2, str(n2))
+        con.close()
+    finally:
+        steam.market_factor = real_factor
+        run.DATA = old_data
+
+
 def main():
     t_fees()
     t_price()
@@ -393,6 +488,7 @@ def main():
     t_store()
     t_migrate()
     t_merge()
+    t_merge_real()
     t_shards()
     t_deadline()
     t_fake()

@@ -266,9 +266,9 @@ def run_merge(args) -> None:
 
     # 标定折算比：只能在这个阶段做，因为要问 Steam 的 priceoverview。
     import steam as st
-    sample = [it["n"] for it in
-              sorted(items, key=lambda x: -(x.get("usd_sell") or 0))
-              if (x.get("usd_sell") or 0) >= 100][:args.fx_samples]
+    sample = [it["n"] for it in sorted(
+                  [it for it in items if (it.get("usd_sell") or 0) >= 100],
+                  key=lambda x: -(x.get("usd_sell") or 0))][:args.fx_samples]
     fx_info = st.market_factor(sample) if sample else {"factor": None, "n": 0}
     fx = fx_info.get("factor")
     if fx:
