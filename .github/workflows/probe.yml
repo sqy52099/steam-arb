@@ -1,7 +1,8 @@
 name: probe
 
-# round 9（决定性）：search/render JSON 已死，但 /market/search 的 HTML 是 200。
-# 要确认：HTML 里有没有「分页 + 每件物品的最低价」。有的话整站就能跑起来。
+# round 10（收官）：定容量模型。用真实生产节奏长时间打 priceoverview，
+# 看 10 分钟能拿到多少个物品，以及 429 之后会不会永远封死。
+# 顺便看 listings render 返回什么、orderbook 的 data 在 queryKey 之前还是之后。
 # 用完即删。
 on:
   workflow_dispatch:
@@ -19,7 +20,7 @@ env:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: 探针
         run: |
@@ -32,6 +33,13 @@ jobs:
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+          HDR = {
+              "User-Agent": UA,
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": BASE + "/market/",
+          }
           HTML_HDR = {
               "User-Agent": UA,
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -60,42 +68,13 @@ jobs:
                   return None, str(e).encode(), time.time() - t0
 
 
-          def unescape(t):
-              return t.replace("\\\\", "\\").replace('\\"', '"')
-
-
-          def balanced(s, start):
-              open_ch = s[start]
-              close_ch = "}" if open_ch == "{" else "]"
-              depth, i, in_str, esc = 0, start, False, False
-              while i < len(s):
-                  c = s[i]
-                  if in_str:
-                      if esc:
-                          esc = False
-                      elif c == "\\":
-                          esc = True
-                      elif c == '"':
-                          in_str = False
-                  else:
-                      if c == '"':
-                          in_str = True
-                      elif c == open_ch:
-                          depth += 1
-                      elif c == close_ch:
-                          depth -= 1
-                          if depth == 0:
-                              return i + 1
-                  i += 1
-              return -1
-
-
-          def search_url(start, count=10, **kw):
-              p = {"appid": 730, "start": start, "count": count,
-                   "sort_column": "popular", "sort_dir": "desc",
-                   "currency": 23, "cc": "CN"}
-              p.update(kw)
-              return BASE + "/market/search?" + urllib.parse.urlencode(p)
+          def uz(raw):
+              if raw[:2] == b"\x1f\x8b":
+                  try:
+                      return gzip.decompress(raw).decode("utf-8", "replace")
+                  except Exception:
+                      pass
+              return raw.decode("utf-8", "replace")
 
 
           print("=== 出口 IP ===")
@@ -106,86 +85,104 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          # ---------- A. 分页 ----------
-          print("=== A. 分页测试 ===")
-          seen_sets = {}
-          for start in (0, 10, 50, 100):
-              st, raw, dt = fetch(search_url(start), HTML_HDR)
-              text = unescape(raw.decode("utf-8", "replace"))
-              names = re.findall(r'"market_hash_name":"([^"]{1,70})"', text)
-              uniq = list(dict.fromkeys(names))
-              seen_sets[start] = uniq
-              print("  start=%-4d HTTP %s %7dB %4.1fs  hash_name %d 个(去重 %d)"
-                    % (start, st, len(raw), dt, len(names), len(uniq)))
-              print("    前 3: %s" % uniq[:3])
-              time.sleep(2)
-          print("")
-          print("  分页是否有效（start=0 与 start=10 首项是否不同）: %s"
-                % ("是" if seen_sets.get(0, [None])[:1]
-                   != seen_sets.get(10, [None])[:1] else "否"))
-          print("")
-
-          # ---------- B. market_search 那段数据的结构 ----------
-          print("=== B. market_search 嵌入数据结构 ===")
-          st, raw, dt = fetch(search_url(0), HTML_HDR)
-          text = unescape(raw.decode("utf-8", "replace"))
-          best = None
-          for m in re.finditer(r'"queryKey":\["market_search"', text):
-              d = text.find('"data":', m.end())
-              if d < 0:
-                  continue
-              b = text.find("{", d)
-              e = balanced(text, b)
-              if e > b and (best is None or e - b > best[1] - best[0]):
-                  best = (b, e)
-          if not best:
-              print("  没找到 market_search 的 data")
-          else:
-              blob = text[best[0]:best[1]]
-              print("  data 长度 %d" % len(blob))
+          # ---------- A. listings render 返回什么 ----------
+          print("=== A. 单物品 listings render ===")
+          u = BASE + "/market/listings/730/Prisma%20Case/render/?" + \
+              urllib.parse.urlencode({"query": "", "start": 0, "count": 5,
+                                      "country": "CN", "language": "zh",
+                                      "currency": 23})
+          st, raw, dt = fetch(u, HDR)
+          body = uz(raw)
+          print("  HTTP %s %dB %.1fs  Content-Type 开头: %r"
+                % (st, len(raw), dt, body[:120]))
+          if body.lstrip().startswith("{"):
               try:
-                  j = json.loads(blob)
+                  j = json.loads(body)
                   print("  顶层键: %s" % sorted(j.keys()))
                   for k, v in j.items():
-                      if isinstance(v, list):
-                          print("  %-20s list[%d]  首项键: %s"
-                                % (k, len(v),
-                                   sorted(v[0].keys()) if v and isinstance(v[0], dict) else type(v[0]).__name__ if v else "-"))
-                      elif isinstance(v, dict):
-                          print("  %-20s dict 键: %s" % (k, sorted(v.keys())[:12]))
-                      else:
-                          print("  %-20s = %r" % (k, v))
-                  # 打印第一条完整记录
-                  for k, v in j.items():
                       if isinstance(v, list) and v and isinstance(v[0], dict):
-                          print("")
-                          print("  第一条 %s 完整记录:" % k)
-                          print("  %s" % json.dumps(v[0], ensure_ascii=False)[:1200])
-                          break
+                          print("  %s[0] 键: %s" % (k, sorted(v[0].keys())))
+                          print("  %s[0] = %s" % (k, json.dumps(v[0], ensure_ascii=False)[:500]))
+                      else:
+                          print("  %-16s = %s" % (k, str(v)[:120]))
               except Exception as e:
-                  print("  json 解析失败: %s" % e)
-                  print("  前 600: %s" % blob[:600])
+                  print("  解析失败 %s" % e)
           print("")
 
-          # ---------- C. 页面里所有 queryKey 里跟我们有关的 ----------
-          print("=== C. 含 price/item/hash 的 queryKey ===")
-          keys = re.findall(r'"queryKey":(\[[^\[\]]{0,140}\])', text)
-          for k in keys:
-              if re.search(r"price|item|hash|search|listing", k, re.I):
-                  if "StoreItem" in k:
-                      continue
-                  print("  %s" % k)
+          # ---------- B. orderbook 的 data 在 queryKey 之前 ----------
+          print("=== B. 物品页 orderbook 的 state.data ===")
+          st, raw, dt = fetch(
+              BASE + "/market/listings/730/Prisma%20Case", HTML_HDR)
+          text = raw.decode("utf-8", "replace")
+          un = text.replace("\\\\", "\\").replace('\\"', '"')
+          i = un.find('"queryKey":["market","orderbook"')
+          print("  queryKey 位置: %d" % i)
+          if i > 0:
+              seg = un[max(0, i - 4000):i]
+              di = seg.rfind('"data":')
+              print("  往前找 data 位置(相对): %d" % di)
+              if di >= 0:
+                  print("  data 之后 1200 字符:")
+                  print("  %s" % seg[di:di + 1200])
+              else:
+                  print("  往前 1200 字符（看 state 长什么样）:")
+                  print("  %s" % seg[-1200:])
           print("")
 
-          # ---------- D. 价格字段试探 ----------
-          print("=== D. 页面里的价格字段 ===")
-          for pat in [r'"sell_price"\s*:\s*"?([\d.,]+)', r'"min_price"\s*:\s*"?([\d.,]+)',
-                      r'"lowest_price"\s*:\s*"([^"]+)"',
-                      r'"strPrice"\s*:\s*"([^"]+)"',
-                      r'"sell_listings"\s*:\s*(\d+)',
-                      r'"sell_price_text"\s*:\s*"([^"]+)"']:
-              hits = re.findall(pat, text)
-              print("  %-46s %d 次  %s" % (pat[:46], len(hits), hits[:4]))
+          # ---------- C. 10 分钟 sustained 吞吐 ----------
+          print("=== C. priceoverview sustained 测试（10 分钟，间隔 2.5s） ===")
+          POOL = ["Prisma Case", "Fracture Case", "Recoil Case",
+                  "Revolution Case", "Danger Zone Case", "Snakebite Case",
+                  "Kilowatt Case", "Gallery Case",
+                  "Dreams & Nightmares Case", "Operation Broken Fang Case",
+                  "Glove Case", "Chroma 2 Case", "Chroma 3 Case",
+                  "Spectrum Case", "Spectrum 2 Case", "Horizon Case",
+                  "Clutch Case", "Free Case", "Fever Case", "Shadow Case",
+                  "Gamma Case", "Gamma 2 Case", "Operation Hydra Case",
+                  "Operation Riptide Case", "Operation Wildfire Case",
+                  "CS20 Case", "Prisma 2 Case", "Fracture Case"]
+          GAP = 2.5
+          BUDGET = 600
+          t_start = time.time()
+          n = ok = r429 = r_other = 0
+          samples = []
+          idx = 0
+          # 记录每分钟的成功数，看是否存在节流
+          bucket = {}
+          while time.time() - t_start < BUDGET:
+              name = POOL[idx % len(POOL)]
+              idx += 1
+              q = urllib.parse.urlencode({"appid": 730, "currency": 23,
+                                          "market_hash_name": name})
+              st, raw, dt = fetch(BASE + "/market/priceoverview/?" + q, HDR)
+              n += 1
+              minute = int((time.time() - t_start) // 60)
+              bucket.setdefault(minute, [0, 0])
+              if st == 200:
+                  ok += 1
+                  bucket[minute][0] += 1
+                  if len(samples) < 3:
+                      samples.append((name, uz(raw)[:110]))
+              elif st == 429:
+                  r429 += 1
+                  bucket[minute][1] += 1
+              else:
+                  r_other += 1
+                  bucket[minute][1] += 1
+                  if r_other <= 2:
+                      print("  非429: HTTP %s %r" % (st, raw[:100]))
+              time.sleep(GAP)
+
+          elapsed = time.time() - t_start
+          print("  总请求 %d  成功 %d  (%.1f%%)  429 %d  其他 %d  用时 %.0fs"
+                % (n, ok, 100.0 * ok / max(n, 1), r429, r_other, elapsed))
+          print("  有效速率: %.1f 件/分钟" % (ok / (elapsed / 60.0)))
+          print("")
+          print("  每分钟 [成功, 失败]:")
+          for m in sorted(bucket):
+              print("    第 %2d 分: %s" % (m, bucket[m]))
+          print("")
+          print("  样例: %s" % samples)
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -200,5 +197,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r9: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r10: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
