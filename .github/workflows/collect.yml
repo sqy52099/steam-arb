@@ -86,13 +86,18 @@ jobs:
           # 请求预算：120 件 × 2.5s ≈ 5 分钟纯间隔，实测含 429 退避约 10 分钟。
           # --deadline 12 让它自己收工，绝不撞 job 的 18 分钟硬超时（硬杀时
           # 一步都没提交，整片白采）。
+          # --pool-cap 400：先按第三方中间价粗排，只在前 400 名里轮转。
+          # 不设上限的话六千多件候选一轮要四个多小时，12 分钟预算只够查到
+          # 清单最前面几十件（按名字排序＝随机），好东西永远碰不到。
+          # --give-up 12：连续被限流 12 次就收工。之前 25 次太宽容，
+          # 出口已经被打进限流时，多试的每一次都只是多睡 48 秒。
           # --fx-samples 4：采完顺手标定折算比。这件事必须放在采集阶段，
           # 因为每个 collect job 有自己的出口 IP，四个都试总有一个能通；
           # merge 只有一个 IP，撞上限流就整轮退回汇率、价格全偏高 6%。
           python run.py --mode collect \
             --shard "$SHARD_ID" --shards "$SHARDS" \
             --batch "${BATCH}" --deadline 12 --fx-samples 4 \
-            --net-give-up 5 \
+            --pool-cap 400 --give-up 12 --net-give-up 5 \
             --out-dir "$OUT_DIR"
           echo "采集 exit=$?"
           # 采不到也要写出空 shard：merge 靠它的 health 判断这一路是被拦还是没数据

@@ -48,6 +48,9 @@ ROUND_SECONDS = 1800
 # 盘口可信度门槛（合并阶段用）。见 run_merge 里的注释说明为什么需要这两个。
 MIN_SELLS = 10      # 挂单少于这么多件，最低挂单价不代表市场
 MAX_DEV = 0.40      # 与第三方自报中间价偏离超过 40% 就判为不可信
+# 预估面值比低于这个数就不值得花一次请求去核实。一次请求 2.5 秒，
+# 而候选有六千多件，全查一遍要四个多小时 —— 只能先粗排再细查。
+MIN_EST = 0.95
 
 # 本轮采集的硬截止时间点（monotonic）。CI 上超时会被硬杀，那时一步都没
 # 提交，整轮白跑；所以宁可少采一点也要自己先收工，把拿到的写出去。
@@ -97,6 +100,41 @@ def usd_cny() -> float:
 
 def round_index() -> int:
     return int(time.time() // ROUND_SECONDS)
+
+
+def est_ratio(c: dict) -> float | None:
+    """用第三方自报的 Steam 中间价，粗略估一下这件值不值得查。
+
+    这个数不是最终结果 —— 中间价是「最近成交价」的中位，不是此刻能立刻
+    卖掉的最优求购价，通常偏高一点，而且中间价本身有延迟。它的用处只有
+    一个：把六千多件排个序，别把请求浪费在明显不划算的东西上。
+
+    真正的盘口还是要查物品页才知道。这里估多少不重要，排对顺序才重要。
+    """
+    mid = c.get("steam_mid_cny") or 0
+    buy = c.get("buy_cny") or 0
+    if mid <= 0 or buy <= 0:
+        return None
+    net = fees.net_from_buyer(mid)
+    return net / buy
+
+
+def pick_candidates(cand: dict[str, dict]) -> list[str]:
+    """先粗排，只留值得花请求的那一批。
+
+    线上教训：六千多件候选照单全查，一轮要四个多小时，而每个 job 的
+    时间预算只有十二分钟 —— 结果是每轮只查到清单最前面那几十件（按名字
+    排序，等于随机），好东西一件都碰不到。排序之后再查，等于把有限的
+    请求全花在最可能有赚头的那些上。
+    """
+    scored = []
+    for name, c in cand.items():
+        r = est_ratio(c)
+        if r is None or r < MIN_EST:
+            continue
+        scored.append((r, name))
+    scored.sort(reverse=True)
+    return [n for _, n in scored]
 
 
 def shard_slice(names: list[str], shard: int, shards: int,
@@ -154,9 +192,16 @@ def run_collect(args) -> None:
         _write_shard(args, [], "两家第三方都拿不到数据")
         return
 
-    names = sorted(cand)
+    names = pick_candidates(cand)
+    log(f"第三方给了 {len(cand)} 个候选，粗排后剩 {len(names)} 件值得查")
+    # 只在前 N 名里轮转。再往后预估越来越不准、盘口也越来越薄，
+    # 花请求去看它们不划算 —— 而不设上限的话，排名靠前的每轮都被
+    # 往后推很远，等于好货几小时才轮到一次。
+    if args.pool_cap > 0 and len(names) > args.pool_cap:
+        log(f"  只取预估最好的前 {args.pool_cap} 件参与轮转")
+        names = names[:args.pool_cap]
     picked = shard_slice(names, args.shard, args.shards, args.batch)
-    log(f"本轮 {len(names)} 个候选，分给 shard{args.shard} 的 {len(picked)} 件")
+    log(f"分给 shard{args.shard} 的 {len(picked)} 件")
     if not picked:
         _write_shard(args, [], "")
         return
@@ -626,7 +671,10 @@ def main() -> None:
     ap.add_argument("--shard", type=int, default=0)
     ap.add_argument("--shards", type=int, default=4, help="总共有几个并行 job")
     ap.add_argument("--batch", type=int, default=140, help="每个 shard 采几件")
-    ap.add_argument("--give-up", type=int, default=25,
+    ap.add_argument("--pool-cap", type=int, default=400,
+                    help="粗排后最多取前多少件参与轮转（0 = 不设上限）。"
+                         "设上限是为了让好货每轮都能轮到，而不是被轮转推得很远")
+    ap.add_argument("--give-up", type=int, default=12,
                     help="连续被限流多少次就放弃本 shard")
     ap.add_argument("--net-give-up", type=int, default=5,
                     help="连续多少次连不上 Steam 就放弃本 shard（和限流分开，"

@@ -361,6 +361,87 @@ def t_shards():
         run.round_index = real_round
 
 
+def t_pick():
+    """粗排错了会表现为「好东西永远排在后面，请求全花在垃圾上」。
+
+    线上事故：六千多件候选按名字排序查，每轮只查到最前面几十件，
+    等于随机抽样；同时一轮要四个多小时，十二分钟预算根本跑不完。
+    """
+    print("\n候选粗排")
+    import run
+
+    c = {
+        # 中间价 100，扣完手续费净得 86.97，买入 50 → 1.74，很划算
+        "Good":    {"buy_cny": 50.0,  "steam_mid_cny": 100.0},
+        # 中间价 100，买入 100 → 0.87，不划算
+        "Meh":     {"buy_cny": 100.0, "steam_mid_cny": 100.0},
+        # 中间价 20，买入 10 → 1.74，也是好货
+        "Cheap":   {"buy_cny": 10.0,  "steam_mid_cny": 20.0},
+        # 没中间价，估不出来
+        "NoMid":   {"buy_cny": 30.0,  "steam_mid_cny": None},
+        # 买入价缺失
+        "NoBuy":   {"buy_cny": 0,     "steam_mid_cny": 100.0},
+    }
+    got = run.pick_candidates(c)
+    check("估不出比率的不进候选", "NoMid" not in got and "NoBuy" not in got, str(got))
+    check("明显不划算的被筛掉", "Meh" not in got, str(got))
+    check("划算的留下且按比率降序",
+          got[:2] == ["Cheap", "Good"] or got[:2] == ["Good", "Cheap"], str(got))
+    r1, r2 = run.est_ratio(c["Good"]), run.est_ratio(c["Cheap"])
+    # 手续费是阶梯取整的，净得 ÷ 买入价 不会因为金额同比缩放而完全相等，
+    # 但同一档位附近应该非常接近 —— 差的只是几分钱的取整缝。
+    check("同样折算的两件估出来的值接近", abs(r1 - r2) < 0.01, f"{r1} vs {r2}")
+    check("估的比率和真手续费算出来的一致",
+          abs(r1 - run.fees.net_from_buyer(100.0) / 50.0) < 1e-9, str(r1))
+    check("空输入返回空", run.pick_candidates({}) == [])
+
+
+def t_pool_cap():
+    """池子上限错了会表现为「好货每轮都被推远，几小时才轮到一次」。"""
+    print("\n轮转池上限")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbcap_")
+    seen = []
+    real_ob = steam.item_orderbook
+    real_cand = run.fetch_candidates
+    real_round = run.round_index
+
+    def fake_ob(hn, appid=730):
+        seen.append(hn)
+        raise steam.RateLimited("429")
+
+    # 30 件候选，比率都够格；池子设成 8 件，batch 4
+    def mk(n):
+        return {f"It{i:02d}": {"buy_cny": float(10 + i),
+                                "src": "waxpeer", "src_qty": 1,
+                                "steam_mid_cny": float(100 + i)}
+                for i in range(n)}
+
+    steam.item_orderbook = fake_ob
+    run.fetch_candidates = lambda p="": mk(30)
+    try:
+        # 选第 3 轮：不加池子上限时 start = 3*8 % 30 = 24，会跳到 It24 往后，
+        # 测试才真的能分辨「有没有上限」。用第 0 轮的话两种实现都落在前 8 件，
+        # 断言空过。
+        run.round_index = lambda: 3
+        args = argparse.Namespace(
+            mode="collect", db="", shard=0, shards=2, batch=4,
+            give_up=1, net_give_up=5, pool_cap=8, out_dir=tmp, in_dir=tmp,
+            fx_samples=0, export_limit=50, within_hours=48, deadline=0)
+        run.run_collect(args)
+        first = list(seen)
+        check("只在前 8 件里取，不超过池子上限",
+              all(int(n[2:]) < 8 for n in first), str(first))
+        check("实际只试了 batch 那么多件", len(first) <= 4, str(len(first)))
+        check("确实拿到了候选（否则上面两条是空过）", len(first) > 0, str(first))
+    finally:
+        steam.item_orderbook = real_ob
+        run.fetch_candidates = real_cand
+        run.round_index = real_round
+
+
 def t_deadline():
     print("\n时间预算")
     import run
@@ -388,7 +469,7 @@ def t_fake():
     try:
         args = argparse.Namespace(
             mode="fake", db=os.path.join(tmp, "f.db"),
-            shard=0, shards=3, batch=6, give_up=25, net_give_up=5,
+            shard=0, shards=3, batch=6, give_up=25, net_give_up=5, pool_cap=0,
             out_dir=os.path.join(tmp, "shards"),
             in_dir=os.path.join(tmp, "shards"), fx_samples=0,
             export_limit=50, within_hours=48, deadline=0)
@@ -475,7 +556,7 @@ def t_merge_real():
     try:
         args = argparse.Namespace(
             mode="merge", db=os.path.join(tmp, "m.db"), shard=0, shards=2,
-            batch=2, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
+            batch=2, give_up=25, net_give_up=5, pool_cap=0, out_dir=shards, in_dir=shards,
             fx_samples=2, export_limit=50, within_hours=48, deadline=0)
         run.run_merge(args)                       # 这里崩，线上就全丢
 
@@ -565,7 +646,7 @@ def t_sanity():
     try:
         args = argparse.Namespace(
             mode="merge", db=os.path.join(tmp, "s.db"), shard=0, shards=1,
-            batch=3, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
+            batch=3, give_up=25, net_give_up=5, pool_cap=0, out_dir=shards, in_dir=shards,
             fx_samples=3, export_limit=50, within_hours=48, deadline=0)
         run.run_merge(args)
         fp = os.path.join(tmp, "latest.json")
@@ -652,7 +733,7 @@ def t_shard_fx():
     try:
         args = argparse.Namespace(
             mode="merge", db=os.path.join(tmp, "f.db"), shard=0, shards=4,
-            batch=1, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
+            batch=1, give_up=25, net_give_up=5, pool_cap=0, out_dir=shards, in_dir=shards,
             fx_samples=6, export_limit=50, within_hours=48, deadline=0)
         run.run_merge(args)
         d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
@@ -694,7 +775,7 @@ def t_fx_reuse():
               "ts": now}]
     args = argparse.Namespace(
         mode="merge", db=os.path.join(tmp, "f.db"), shard=0, shards=1,
-        batch=1, give_up=25, net_give_up=5, out_dir=shards, in_dir=shards,
+        batch=1, give_up=25, net_give_up=5, pool_cap=0, out_dir=shards, in_dir=shards,
         fx_samples=0, export_limit=50, within_hours=48, deadline=0)
 
     def one_shard(fx):
@@ -786,11 +867,11 @@ def t_net_give_up():
     steam.item_orderbook = boom
     run.fetch_candidates = lambda p="": {
         f"Item {i}": {"buy_cny": 10.0, "src": "waxpeer", "src_qty": 1,
-                      "steam_mid_cny": None} for i in range(40)}
+                      "steam_mid_cny": 20.0} for i in range(40)}
     try:
         args = argparse.Namespace(
             mode="collect", db="", shard=0, shards=1, batch=40,
-            give_up=25, net_give_up=5, out_dir=tmp, in_dir=tmp,
+            give_up=25, net_give_up=5, pool_cap=0, out_dir=tmp, in_dir=tmp,
             fx_samples=0, export_limit=50, within_hours=48, deadline=0)
         run.run_collect(args)
         check("连不上 5 次就收工，不再往下试",
@@ -926,6 +1007,8 @@ def main():
     t_fetch_code()
     t_fx_reuse()
     t_zh_names()
+    t_pick()
+    t_pool_cap()
     t_shards()
     t_deadline()
     t_fake()
