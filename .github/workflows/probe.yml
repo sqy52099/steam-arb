@@ -1,8 +1,9 @@
 name: probe
 
-# 一次性诊断 round 5：新版 SSR 物品页里没有 Market_LoadOrderSpread，
-# 但可能直接把盘口数据嵌在 HTML 里。同时试几个候选接口。
-# 结果写进 probe-log 分支。用完即删。
+# round 6：搞清两件事
+#  (a) 新版 SSR 页里的 orderbook / strItemName 能不能拿到真实求购价
+#  (b) priceoverview 的真实吞吐（1.0s 间隔）
+# 用完即删。
 on:
   workflow_dispatch:
   push:
@@ -69,6 +70,15 @@ jobs:
                   return None, str(e).encode(), time.time() - t0
 
 
+          def uz(raw):
+              if raw[:2] == b"\x1f\x8b":
+                  try:
+                      return gzip.decompress(raw).decode("utf-8", "replace")
+                  except Exception:
+                      pass
+              return raw.decode("utf-8", "replace")
+
+
           print("=== 出口 IP ===")
           try:
               with urllib.request.urlopen("https://api.ipify.org", timeout=15) as r:
@@ -77,64 +87,97 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          st, raw, _ = fetch(
-              BASE + "/market/listings/730/" + QN, HTML_HDR)
+          st, raw, _ = fetch(BASE + "/market/listings/730/" + QN, HTML_HDR)
           text = raw.decode("utf-8", "replace")
-          print("物品页 → HTTP %s  %dB" % (st, len(raw)))
+          print("物品页 HTTP %s %dB" % (st, len(raw)))
           print("")
 
-          print("=== 盘口关键字 ===")
-          for kw in ["buy_order_graph", "highest_buy_order", "sell_order_graph",
-                     "lowest_sell_order", "buy_order_count", "sell_order_count",
-                     "orders", "orderbook", "bid", "asks", "bids",
-                     "price_median", "price_prefix", "purchases",
-                     "eCurrency", "wallet", "__INITIAL", "__NEXT",
-                     "application/json", "data-props", "data-ssr"]:
-              print("  %-20s %d" % (kw, text.count(kw)))
-          print("")
-
-          # 找 JSON 里的键名清单
-          print("=== JSON 顶层键（抓所有 \"key\": 形态） ===")
-          keys = {}
-          for m in re.finditer(r'"([a-z_][a-z0-9_]{2,30})"\s*:', text):
-              keys[m.group(1)] = keys.get(m.group(1), 0) + 1
-          interesting = [k for k in keys if any(
-              s in k for s in ("order", "buy", "sell", "price", "name", "id",
-                               "hash", "item", "market", "qty", "amount"))]
-          for k in sorted(interesting)[:60]:
-              print("  %-28s %d" % (k, keys[k]))
-          print("")
-
-          print("=== hash_name / 物品标识上下文 ===")
-          for m in list(re.finditer(r"Prisma Case", text))[:5]:
-              ctx = text[max(0, m.start() - 150):m.end() + 150]
-              print("  %s" % ctx.replace("\\", "").replace("\n", " ")[:300])
+          print("=== orderbook 上下文 ===")
+          for m in re.finditer(r"orderbook", text):
+              ctx = text[max(0, m.start() - 250):m.end() + 250]
+              print("  %s" % ctx.replace("\n", " ")[:500])
               print("  ---")
           print("")
 
-          print("=== 候选接口 ===")
-          cands = [
-              ("价格历史 pricehistory",
-               BASE + "/market/pricehistory/?" + urllib.parse.urlencode(
-                   {"appid": 730, "market_hash_name": NAME})),
-              ("新 API: listings json",
-               BASE + f"/market/listings/730/{QN}?format=json"),
-              ("itemordershistogram 无 nameid",
-               BASE + "/market/itemordershistogram/?" + urllib.parse.urlencode(
-                   {"norender": 1, "country": "CN", "language": "zh",
-                    "currency": 23})),
-              ("market/search 非 render JSON 变体",
-               BASE + "/market/search/render/?" + urllib.parse.urlencode(
-                   {"appid": 730, "norender": 1, "count": 10, "start": 0,
-                    "query": "", "search_descriptions": 0,
-                    "sort_column": "popular", "sort_dir": "desc",
-                    "currency": 23, "country": "CN"})),
-          ]
-          for label, u in cands:
-              st, raw, dt = fetch(u, HDR)
-              print("  %-28s HTTP %-4s %5.1fs %r" %
-                    (label, st, dt, raw[:160]))
-              time.sleep(2)
+          # 找所有 API 路径线索
+          print("=== 页面里出现的 /market/ 路径 ===")
+          paths = set(re.findall(r"/market/[a-z/_]+", text))
+          for p in sorted(paths):
+              print("  %s" % p)
+          print("")
+
+          # 提取 strItemName
+          m = re.search(r'"strItemName"\s*:\s*"([A-Za-z0-9]+)"', text)
+          strname = m.group(1) if m else None
+          print("strItemName = %s" % strname)
+          print("")
+
+          print("=== 带 strItemName / classid 试接口 ===")
+          if strname:
+              tries = [
+                  ("histogram by strItemName",
+                   BASE + "/market/itemordershistogram/?" + urllib.parse.urlencode(
+                       {"norender": 1, "country": "CN", "language": "zh",
+                        "currency": 23, "item_nameid": strname})),
+                  ("orderbook json",
+                   BASE + f"/market/listings/730/{QN}/orderbook"),
+                  ("listings render (已有数据?)",
+                   BASE + f"/market/listings/730/{QN}/render/?" +
+                   urllib.parse.urlencode({"query": "", "start": 0, "count": 10,
+                                           "country": "CN", "language": "zh",
+                                           "currency": 23})),
+              ]
+              for label, u in tries:
+                  st2, raw2, dt = fetch(u, HDR)
+                  body = uz(raw2)
+                  print("  %-26s HTTP %-4s %5.1fs %r" %
+                        (label, st2, dt, body[:200]))
+                  time.sleep(2)
+          print("")
+
+          # price_median/purchases 能不能解析成销量序列
+          print("=== 页面内嵌销量序列（前 2 条） ===")
+          ms = list(re.finditer(
+              r'\{"time":(\d+),[^}]*"purchases":(\d+)\}', text))
+          print("  匹配 %d 条" % len(ms))
+          for mm in ms[:2]:
+              print("    time=%s purchases=%s" % (mm.group(1), mm.group(2)))
+          print("")
+
+          # priceoverview 吞吐：1.0 秒间隔打 30 次
+          print("=== priceoverview 30 次（间隔 1.0s） ===")
+          items = ["Prisma Case", "Fracture Case", "Recoil Case",
+                   "Revolution Case", "Danger Zone Case", "Snakebite Case",
+                   "Kilowatt Case", "Gallery Case", "Dreams & Nightmares Case",
+                   "Operation Broken Fang Case"]
+          ok = 0
+          for i in range(30):
+              nm = items[i % len(items)]
+              q = urllib.parse.urlencode({"appid": 730, "currency": 23,
+                                          "market_hash_name": nm})
+              st3, raw3, dt = fetch(BASE + "/market/priceoverview/?" + q, HDR)
+              if st3 == 200:
+                  ok += 1
+              else:
+                  print("  #%02d HTTP %s" % (i, st3))
+              time.sleep(1.0)
+          print("  → 成功 %d/30（间隔 1.0s）" % ok)
+          print("")
+
+          # 物品页吞吐：间隔 1.0s 打 8 次
+          print("=== 物品页 8 次（间隔 1.0s） ===")
+          ok2 = 0
+          for i in range(8):
+              nm = items[i % len(items)]
+              st4, raw4, dt = fetch(
+                  BASE + "/market/listings/730/" + urllib.parse.quote(nm),
+                  HTML_HDR)
+              if st4 == 200:
+                  ok2 += 1
+              else:
+                  print("  #%02d HTTP %s" % (i, st4))
+              time.sleep(1.0)
+          print("  → 成功 %d/8" % ok2)
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -149,5 +192,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r5: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r6: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
