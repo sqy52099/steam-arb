@@ -1,8 +1,9 @@
 name: probe
 
-# round 11（定案）：物品页已确认含完整盘口（amtMaxBuyOrder / amtMinSellOrder
-# / rgCompactBuyOrders）。这轮只回答一个问题：物品页能跑多快、能撑多少件。
-# 顺便验证解析器在真实 HTML 上是否稳定。用完即删。
+# round 12：物品页内嵌盘口到底是美元分还是人民币分？
+#   Prisma Case amtMaxBuyOrder=117，但 priceoverview 最低价 ¥7.96
+#   → 117 分若是人民币就离谱（¥1.17），若是美元则 $1.17≈¥8.3 合理。
+# 同时测 cookie steamCurrency 能不能把盘口换成人民币。用完即删。
 on:
   workflow_dispatch:
   push:
@@ -19,7 +20,7 @@ env:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 10
     steps:
       - name: 探针
         run: |
@@ -39,32 +40,44 @@ jobs:
               "Accept-Encoding": "gzip, deflate",
               "Referer": BASE + "/market/",
           }
-
-          jar = http.cookiejar.CookieJar()
-          OP = urllib.request.build_opener(
-              urllib.request.HTTPCookieProcessor(jar))
-
-
-          def fetch(u, headers, timeout=45):
-              req = urllib.request.Request(u, headers=headers)
-              t0 = time.time()
-              try:
-                  with OP.open(req, timeout=timeout) as r:
-                      raw = r.read()
-                      if r.headers.get("Content-Encoding") == "gzip":
-                          raw = gzip.decompress(raw)
-                      return r.status, raw, time.time() - t0
-              except urllib.error.HTTPError as e:
-                  return e.code, e.read()[:300], time.time() - t0
-              except Exception as e:
-                  return None, str(e).encode(), time.time() - t0
-
-
+          JSON_HDR = {
+              "User-Agent": UA,
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": BASE + "/market/",
+          }
           OB_KEY = '"queryKey":["market","orderbook"'
 
 
-          def parse_orderbook(html):
-              """从物品页 HTML 抽盘口。返回 dict 或 None。"""
+          def mkop(cookies=None):
+              jar = http.cookiejar.CookieJar()
+              if cookies:
+                  import http.cookiejar as cj
+                  for k, v in cookies.items():
+                      jar.set_cookie(cj.Cookie(0, k, v, None, False,
+                                               ".steamcommunity.com", True,
+                                               False, "/", True, False, None,
+                                               False, None, None, {}))
+              return urllib.request.build_opener(
+                  urllib.request.HTTPCookieProcessor(jar))
+
+
+          def fetch(op, u, headers, timeout=45):
+              req = urllib.request.Request(u, headers=headers)
+              try:
+                  with op.open(req, timeout=timeout) as r:
+                      raw = r.read()
+                      if r.headers.get("Content-Encoding") == "gzip":
+                          raw = gzip.decompress(raw)
+                      return r.status, raw
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()[:300]
+              except Exception as e:
+                  return None, str(e).encode()
+
+
+          def parse_ob(html):
               un = html.replace("\\\\", "\\").replace('\\"', '"')
               i = un.find(OB_KEY)
               if i < 0:
@@ -75,9 +88,8 @@ jobs:
                   di = seg.rfind('"data":{')
               if di < 0:
                   return None
-              start = seg.find("{", di)
-              # 括号配对找结尾
-              depth, j, in_str, esc = 0, start, False, False
+              s = seg.find("{", di)
+              depth, j, in_str, esc = 0, s, False, False
               while j < len(seg):
                   c = seg[j]
                   if in_str:
@@ -98,16 +110,24 @@ jobs:
                               break
                   j += 1
               try:
-                  return json.loads(seg[start:j + 1])
+                  return json.loads(seg[s:j + 1])
               except Exception:
                   return None
 
 
-          def flat_pairs(a):
-              """[价格, 件数, 价格, 件数 ...] → [(价格, 件数)]"""
-              if not isinstance(a, list):
-                  return []
-              return [(a[k], a[k + 1]) for k in range(0, len(a) - 1, 2)]
+          def po(op, name):
+              q = urllib.parse.urlencode({"appid": 730, "currency": 23,
+                                          "market_hash_name": name})
+              st, raw = fetch(op, BASE + "/market/priceoverview/?" + q, JSON_HDR)
+              if st != 200:
+                  return st, None
+              try:
+                  j = json.loads(raw)
+              except Exception:
+                  return st, None
+              lp = j.get("lowest_price") or ""
+              m = re.search(r"([\d.,]+)", lp)
+              return st, (float(m.group(1).replace(",", "")) if m else None)
 
 
           print("=== 出口 IP ===")
@@ -118,77 +138,70 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          # ---------- A. 解析器稳定性 + 正确性 ----------
-          print("=== A. 解析器验证（6 件不同价位） ===")
-          TEST = ["Prisma Case", "Fracture Case", "Kilowatt Case",
-                  "Gallery Case", "Dreams & Nightmares Case",
-                  "AWP | Asiimov (Field-Tested)"]
-          print("  %-34s %7s %7s %8s %8s %6s" %
-                ("物品", "求购分", "卖价分", "买单选", "卖单选", "买深度"))
-          for name in TEST:
+          OP = mkop()
+          ITEMS = ["Prisma Case", "Fracture Case", "Kilowatt Case",
+                   "Gallery Case", "AWP | Asiimov (Field-Tested)",
+                   "AK-47 | Redline (Field-Tested)"]
+
+          print("=== A. 无 cookie：隐含汇率 ===")
+          print("  %-32s %8s %8s %10s %10s" %
+                ("物品", "eCur", "挂单分", "PO人民币", "隐含汇率"))
+          for name in ITEMS:
               u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
-              st, raw, dt = fetch(u, HTML_HDR)
+              st, raw = fetch(OP, u, HTML_HDR)
               if st != 200:
-                  print("  %-34s HTTP %s" % (name, st))
+                  print("  %-32s 页面 HTTP %s" % (name[:32], st))
                   time.sleep(3)
                   continue
-              ob = parse_orderbook(raw.decode("utf-8", "replace"))
+              ob = parse_ob(raw.decode("utf-8", "replace"))
+              st2, lp = po(OP, name)
+              time.sleep(3)
               if not ob:
-                  print("  %-34s 解析失败 (%dB)" % (name, len(raw)))
+                  print("  %-32s 盘口解析失败" % name[:32])
+                  continue
+              sell = ob.get("amtMinSellOrder")
+              cur = ob.get("eCurrency")
+              rate = (lp / (sell / 100.0)) if (lp and sell) else None
+              print("  %-32s %8s %8s %10s %10s" %
+                    (name[:32], cur, sell, lp,
+                     ("%.2f" % rate) if rate else "-"))
+          print("  （隐含汇率 ≈7 说明是美元分；≈1 说明是人民币分）")
+          print("")
+
+          print("=== B. 带 steamCurrency cookie ===")
+          for cook in ({"steamCurrency": "CNY"},
+                       {"steamCurrency": "23"},
+                       {"steamCurrency": "cny"}):
+              OPC = mkop(cook)
+              name = "Prisma Case"
+              u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
+              st, raw = fetch(OPC, u, HTML_HDR)
+              if st != 200:
+                  print("  cookie %-24s 页面 HTTP %s" % (cook, st))
+                  time.sleep(3)
+                  continue
+              ob = parse_ob(raw.decode("utf-8", "replace"))
+              if ob:
+                  print("  cookie %-24s eCurrency=%s 挂单分=%s 求购分=%s"
+                        % (cook, ob.get("eCurrency"), ob.get("amtMinSellOrder"),
+                           ob.get("amtMaxBuyOrder")))
               else:
-                  buys = flat_pairs(ob.get("rgCompactBuyOrders"))
-                  depth = sum(q for _, q in buys[:10])
-                  print("  %-34s %7s %7s %8s %8s %6d" %
-                        (name[:34], ob.get("amtMaxBuyOrder"),
-                         ob.get("amtMinSellOrder"), ob.get("cBuyOrders"),
-                         ob.get("cSellOrders"), depth))
+                  print("  cookie %-24s 解析失败" % cook)
               time.sleep(3)
           print("")
 
-          # ---------- B. 吞吐：物品页 sustained ----------
-          print("=== B. 物品页 sustained（8 分钟，间隔 2.5s） ===")
-          POOL = ["Prisma Case", "Fracture Case", "Recoil Case",
-                  "Revolution Case", "Danger Zone Case", "Snakebite Case",
-                  "Kilowatt Case", "Gallery Case", "Glove Case",
-                  "Chroma 2 Case", "Chroma 3 Case", "Spectrum Case",
-                  "Spectrum 2 Case", "Horizon Case", "Clutch Case",
-                  "Free Case", "Fever Case", "Shadow Case", "Gamma Case",
-                  "Gamma 2 Case", "CS20 Case", "Prisma 2 Case",
-                  "Dreams & Nightmares Case", "Operation Broken Fang Case"]
-          GAP, BUDGET = 2.5, 480
-          t0 = time.time()
-          n = ok = bad = err = 0
-          bucket = {}
-          idx = 0
-          got_ob = 0
-          while time.time() - t0 < BUDGET:
-              name = POOL[idx % len(POOL)]
-              idx += 1
-              u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
-              st, raw, dt = fetch(u, HTML_HDR)
-              n += 1
-              m = int((time.time() - t0) // 60)
-              bucket.setdefault(m, [0, 0])
-              if st == 200:
-                  ok += 1
-                  bucket[m][0] += 1
-                  if parse_orderbook(raw.decode("utf-8", "replace")):
-                      got_ob += 1
-              else:
-                  bucket[m][1] += 1
-                  if st != 429 and err < 2:
-                      err += 1
-                      print("  非429: HTTP %s %r" % (st, raw[:100]))
-              time.sleep(GAP)
-          el = time.time() - t0
-          print("  总 %d  成功 %d (%.0f%%)  失败 %d  用时 %.0fs"
-                % (n, ok, 100.0 * ok / max(n, 1), n - ok, el))
-          print("  解析出盘口 %d/%d" % (got_ob, ok))
-          print("  有效速率: %.1f 件/分钟 → 10 分钟 %.0f 件"
-                % (ok / (el / 60.0), ok / (el / 60.0) * 10))
-          print("  每分钟 [成功, 失败]:")
-          for m in sorted(bucket):
-              print("    第 %2d 分: %s" % (m, bucket[m]))
+          print("=== C. 页面里的货币标记 ===")
+          u = BASE + "/market/listings/730/Prisma%20Case"
+          st, raw = fetch(OP, u, HTML_HDR)
+          text = raw.decode("utf-8", "replace")
+          for pat in [r'"eCurrency"\s*:\s*(\d+)', r'"strPrice"\s*:\s*"([^"]{1,20})"',
+                      r'"currency"\s*:\s*(\d+)', r'"eCurrency"\s*:\s*\{\s*"id"\s*:\s*(\d+)']:
+              hits = re.findall(pat, text)
+              print("  %-44s %d 次 %s" % (pat[:44], len(hits), hits[:5]))
+          print("")
+          # currency 对象形态
+          m = re.search(r'"eCurrency"\s*:\s*\{[^}]{0,200}\}', text)
+          print("  eCurrency 原样: %s" % (m.group(0) if m else "(不是对象)"))
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -203,5 +216,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r11: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r12: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
