@@ -85,11 +85,28 @@ pub_fee   = max(1, floor(net × 10%))
 ## 部署
 
 1. 仓库设成 **public**（私有仓库 Actions 2000 分钟/月会超）
-2. 推上去，`.github/workflows/collect.yml` 每 10 分钟跑一次（实际延迟 5~15 分钟）
+2. 推上去，`.github/workflows/collect.yml` 每 30 分钟跑一次（实际延迟 5~15 分钟）
 3. Cloudflare Pages 连这个仓库：
    - 构建命令 `python build_site.py`
    - 输出目录 `_site`
 4. 汇率可在仓库 Variables 里设 `USD_CNY`，或放 `data/rate.json`
+
+### 时间预算（改参数前必看）
+
+Actions 单 job 上限 25 分钟，而 Steam 那边必须限速。当前配比：
+
+```
+列表 60 页 + 补 30 个 nameid + 查 120 件求购价 = 210 请求
+210 × 3.5 秒 ≈ 12 分钟   →  --deadline 12
+```
+
+`--deadline` 是采集自己的止损线，到点就停、把已拿到的写回去。
+**不能只靠 job 的 25 分钟硬超时** —— 那会把进程直接杀掉，`push` 那步
+根本不执行，整轮白跑。想加量就同时加 `--deadline`，别让请求数超过
+`deadline 分钟 × 17`（17 = 60/3.5）。
+
+cron 也不能排得比一轮耗时更密：一轮要 15~20 分钟，按 10 分钟排会不断
+堆队列，最后全是排队等超时的废跑。
 
 ## 边界
 
