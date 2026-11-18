@@ -153,11 +153,11 @@ async function load(){
     const warn = [];
     if (ageMin > 90)
       warn.push(`⚠ 数据已经 ${fmtAge(ageMin)}没更新了，下面的价格很可能已失效，别照着下单。`);
-    // 折算比没标定成功时，代码会退回真实汇率算人民币价。汇率比 Steam 国区
-    // 定价高约 6%，方向正好是「让你以为更赚」，所以必须挂在最显眼的地方。
-    const h = j.health || {};
-    if (h.fx && h.fx.ok === false)
-      warn.push('⚠ 折算比没标定成功，人民币价是按真实汇率算的，比 Steam 国区实际定价高约 6% —— 真实收益会比这里低。');
+    // 折算比不理想时必须挂在最显眼的地方。两档严重程度不一样：
+    // 沿用上一轮的标定值只差几个点；
+    // 退回真实汇率差约 6%，方向正好是「让你以为更赚」。
+    if (j.fx_note)
+      warn.push('⚠ ' + j.fx_note + '。');
     $('disc').textContent = (warn.length ? warn.join(' ') + ' ' : '') + (j.note || '');
     if (warn.length) $('disc').classList.add('stale');
   }catch(e){

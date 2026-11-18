@@ -348,16 +348,42 @@ def run_merge(args) -> None:
         if fx:
             log("采集阶段没给出折算比，这里现问 Steam 才拿到")
 
+    fx_note = ""
     if fx:
         mark("fx", True,
-             f"{fx} ×{fx_info['n']} 样本 · 来自{fx_info.get('src') or 'merge'}",
-             )
+             f"{fx} ×{fx_info['n']} 样本 · 来自{fx_info.get('src') or 'merge'}")
         log(f"折算比 1 USD = ¥{fx}（{fx_info['n']} 个样本）")
     else:
-        # 标定失败就用真实汇率兜底，但必须标出来 —— 这时候数字会偏高。
-        fx = usd_cny()
-        mark("fx", False, f"标定失败，退回汇率 {fx}（价格可能偏高约 6%）")
-        log(f"折算比标定失败，退回真实汇率 {fx}")
+        # 本轮没标出来。**不要立刻退回汇率** —— 汇率 7.1 比 Steam 国区定价
+        # 高约 6%，用它算出来的每个数都偏乐观，方向正好是「让你以为更赚」。
+        # 先沿上一次真正测到的值：国区定价和汇率的差距变化很慢，昨天的
+        # 折算比今天照样能用；沿用的时候说清楚是哪天的，别让人以为是新的。
+        prev = None
+        prev_ts = None
+        try:
+            prev = float(meta_get(con, "fx") or 0) or None
+            prev_ts = int(meta_get(con, "fx_ts") or 0) or None
+        except Exception:
+            pass
+        if prev:
+            fx = prev
+            if prev_ts:
+                age_h = int((time.time() - prev_ts) / 3600)
+                when = "刚刚" if age_h < 1 else f"{age_h} 小时前"
+            else:
+                when = "上一次"
+            mark("fx", False,
+                 f"本轮没标定出来，沿用{when}的 {fx}（国区定价变化很慢，能用）")
+            log(f"折算比本轮没标定出来，沿用{when}的 {fx}")
+            fx_note = (f"本轮没能标定折算比，用的是{when}测到的 {fx}"
+                       if when != "刚刚" else
+                       f"本轮没能标定折算比，用的是最近一次测到的 {fx}")
+        else:
+            fx = usd_cny()
+            mark("fx", False, f"从没标定成功过，退回汇率 {fx}（价格偏高约 6%）")
+            log(f"折算比从没标定成功过，退回真实汇率 {fx}")
+            fx_note = (f"折算比一次都没标定成功过，现在用真实汇率 {fx} 换算，"
+                       "比 Steam 国区实际定价高约 6%，真实收益会比这里低")
 
     rows = []
     now = int(time.time())
@@ -429,6 +455,11 @@ def run_merge(args) -> None:
         log(f"清理 7 天前没再出现的 {gone} 条")
     meta_set(con, "last_merge", int(time.time()))
     meta_set(con, "fx", fx)
+    if fx_info.get("factor"):
+        # 只有真标出来的才更新 fx_ts，沿用的旧值不该把自己刷新成「刚测的」
+        meta_set(con, "fx_ts", int(time.time()))
+        meta_set(con, "fx_src", fx_info.get("src") or "merge")
+    meta_set(con, "fx_note", fx_note)
     log(f"库状态：{stats(con)}")
     export(args, con)
 
@@ -461,6 +492,9 @@ def export(args, con) -> None:
         "generated": int(time.time()),
         "rate_usd_cny": usd_cny(),
         "fx": fx,
+        # 折算比不理想时给前端一句人话，空字符串表示没问题。分成「沿用旧值」
+        # 和「退回汇率」两种情况——前者差几个点，后者差 6% 且方向危险。
+        "fx_note": (meta_get(con, "fx_note") or ""),
         "currency": "CNY",
         "count": len(rows),
         "note": ("ratio = 按 Steam 求购价卖出的净得 ÷ 第三方买入价，1 以上才不亏面值；"

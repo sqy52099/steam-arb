@@ -669,6 +669,78 @@ def t_shard_fx():
         run.DATA = old_data
 
 
+def t_fx_reuse():
+    """标定没成功时沿用上次测到的折算比，绝不轻易退回汇率。
+
+    线上连跑三轮 fx 都失败（merge 一个 IP、采集阶段也只有 11/61 成功），
+    退回汇率 7.1 会让所有人民币价偏高约 6%，方向正好是「让你以为更赚」。
+    国区定价和汇率的差距变化很慢，昨天的折算比今天照样能用。
+    """
+    print("\n折算比沿用上次的值")
+    import argparse
+    import run
+
+    tmp = tempfile.mkdtemp(prefix="arbfxreuse_")
+    old_data = run.DATA
+    run.DATA = tmp
+    shards = os.path.join(tmp, "shards")
+    os.makedirs(shards)
+
+    now = int(time.time())
+    items = [{"n": "Thing", "usd_bid": 1000, "usd_sell": 1400,
+              "buy": 10.0, "src": "waxpeer", "qty": 5, "depth": 3,
+              "blevels": 2, "buys": 400, "sells": 300, "mid": None,
+              "ts": now}]
+    args = argparse.Namespace(
+        mode="merge", db=os.path.join(tmp, "f.db"), shard=0, shards=1,
+        batch=1, give_up=25, out_dir=shards, in_dir=shards,
+        fx_samples=0, export_limit=50, within_hours=48, deadline=0)
+
+    def one_shard(fx):
+        with open(os.path.join(shards, "shard-00.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"shard": 0, "shards": 1, "round": 12, "ts": now,
+                       "tried": 1, "err": "", "fx": fx,
+                       "health": {"steam_orders": {"ok": True, "detail": "1/1"}},
+                       "items": items}, f, ensure_ascii=False)
+
+    real_factor = steam.market_factor
+    steam.market_factor = lambda s, **kw: {"factor": None, "n": 0}
+    try:
+        # 第一次：从没标定过 → 只能退回汇率，并且必须明说
+        one_shard({})
+        run.run_merge(args)
+        d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
+        rate = d["rate_usd_cny"]
+        check("从没标定过时退回汇率", d.get("fx") == rate, str(d.get("fx")))
+        check("退回汇率时明说后果（涨约 6%）",
+              "6%" in (d.get("fx_note") or ""), str(d.get("fx_note")))
+
+        # 第二次：真标出来了 → 记下来
+        one_shard({"factor": 6.73, "n": 4, "spread": 0.01,
+                   "detail": [], "src": "shard"})
+        run.run_merge(args)
+        d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
+        check("标定成功时用标定值", abs((d.get("fx") or 0) - 6.73) < 0.01,
+              str(d.get("fx")))
+        check("标定成功时不带提示", not (d.get("fx_note") or ""),
+              str(d.get("fx_note")))
+
+        # 第三次：又没标出来 → 沿用 6.73，不是汇率
+        one_shard({})
+        run.run_merge(args)
+        d = json.load(open(os.path.join(tmp, "latest.json"), encoding="utf-8"))
+        check("没标出来时沿用上次的值，不退回汇率",
+              abs((d.get("fx") or 0) - 6.73) < 0.01, str(d.get("fx")))
+        check("沿用旧值时说清是最近一次测的",
+              "最近一次" in (d.get("fx_note") or "")
+              or "小时前" in (d.get("fx_note") or ""),
+              str(d.get("fx_note")))
+    finally:
+        steam.market_factor = real_factor
+        run.DATA = old_data
+
+
 def main():
     t_fees()
     t_price()
@@ -680,6 +752,7 @@ def main():
     t_merge_real()
     t_sanity()
     t_shard_fx()
+    t_fx_reuse()
     t_shards()
     t_deadline()
     t_fake()
