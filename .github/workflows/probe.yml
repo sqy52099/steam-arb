@@ -1,7 +1,7 @@
 name: probe
 
-# 一次性诊断 round 4：物品页 200 但找不到 Market_LoadOrderSpread，
-# 说明页面结构变了。把 HTML 捞回来找 nameid 到底在哪。
+# 一次性诊断 round 5：新版 SSR 物品页里没有 Market_LoadOrderSpread，
+# 但可能直接把盘口数据嵌在 HTML 里。同时试几个候选接口。
 # 结果写进 probe-log 分支。用完即删。
 on:
   workflow_dispatch:
@@ -32,6 +32,13 @@ jobs:
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+          HDR = {
+              "User-Agent": UA,
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+              "X-Requested-With": "XMLHttpRequest",
+              "Referer": BASE + "/market/",
+          }
           HTML_HDR = {
               "User-Agent": UA,
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -40,7 +47,7 @@ jobs:
               "Referer": BASE + "/market/",
           }
           NAME = "Prisma Case"
-          url = BASE + "/market/listings/730/" + urllib.parse.quote(NAME)
+          QN = urllib.parse.quote(NAME)
 
           jar = http.cookiejar.CookieJar()
           OP = urllib.request.build_opener(
@@ -49,16 +56,17 @@ jobs:
 
           def fetch(u, headers, timeout=30):
               req = urllib.request.Request(u, headers=headers)
+              t0 = time.time()
               try:
                   with OP.open(req, timeout=timeout) as r:
                       raw = r.read()
                       if r.headers.get("Content-Encoding") == "gzip":
                           raw = gzip.decompress(raw)
-                      return r.status, raw, dict(r.headers)
+                      return r.status, raw, time.time() - t0
               except urllib.error.HTTPError as e:
-                  return e.code, e.read()[:600], dict(e.headers)
+                  return e.code, e.read()[:400], time.time() - t0
               except Exception as e:
-                  return None, str(e).encode(), {}
+                  return None, str(e).encode(), time.time() - t0
 
 
           print("=== 出口 IP ===")
@@ -69,60 +77,64 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          st, raw, hdrs = fetch(url, HTML_HDR)
+          st, raw, _ = fetch(
+              BASE + "/market/listings/730/" + QN, HTML_HDR)
           text = raw.decode("utf-8", "replace")
-          print("物品页 %s → HTTP %s  %dB" % (NAME, st, len(raw)))
-          print("Content-Encoding: %s" % hdrs.get("Content-Encoding"))
-          print("Content-Type: %s" % hdrs.get("Content-Type"))
+          print("物品页 → HTTP %s  %dB" % (st, len(raw)))
           print("")
 
-          # 找各种可能的 nameid 载体
-          print("=== 关键字扫描 ===")
-          pats = [
-              ("Market_LoadOrderSpread", r"Market_LoadOrderSpread"),
-              ("item_nameid", r"item_nameid"),
-              ("itemNameId", r"itemNameId"),
-              ("g_rgMarketItemNameId", r"g_rgMarketItemNameId"),
-              ("nameid 任何形式", r"nameid"),
-              ("1999428 类 7 位数字", r"\b\d{6,8}\b"),
-              ("ItemOrdersHistogram", r"ItemOrdersHistogram"),
-              ("g_strItemNameId", r"g_strItemNameId"),
+          print("=== 盘口关键字 ===")
+          for kw in ["buy_order_graph", "highest_buy_order", "sell_order_graph",
+                     "lowest_sell_order", "buy_order_count", "sell_order_count",
+                     "orders", "orderbook", "bid", "asks", "bids",
+                     "price_median", "price_prefix", "purchases",
+                     "eCurrency", "wallet", "__INITIAL", "__NEXT",
+                     "application/json", "data-props", "data-ssr"]:
+              print("  %-20s %d" % (kw, text.count(kw)))
+          print("")
+
+          # 找 JSON 里的键名清单
+          print("=== JSON 顶层键（抓所有 \"key\": 形态） ===")
+          keys = {}
+          for m in re.finditer(r'"([a-z_][a-z0-9_]{2,30})"\s*:', text):
+              keys[m.group(1)] = keys.get(m.group(1), 0) + 1
+          interesting = [k for k in keys if any(
+              s in k for s in ("order", "buy", "sell", "price", "name", "id",
+                               "hash", "item", "market", "qty", "amount"))]
+          for k in sorted(interesting)[:60]:
+              print("  %-28s %d" % (k, keys[k]))
+          print("")
+
+          print("=== hash_name / 物品标识上下文 ===")
+          for m in list(re.finditer(r"Prisma Case", text))[:5]:
+              ctx = text[max(0, m.start() - 150):m.end() + 150]
+              print("  %s" % ctx.replace("\\", "").replace("\n", " ")[:300])
+              print("  ---")
+          print("")
+
+          print("=== 候选接口 ===")
+          cands = [
+              ("价格历史 pricehistory",
+               BASE + "/market/pricehistory/?" + urllib.parse.urlencode(
+                   {"appid": 730, "market_hash_name": NAME})),
+              ("新 API: listings json",
+               BASE + f"/market/listings/730/{QN}?format=json"),
+              ("itemordershistogram 无 nameid",
+               BASE + "/market/itemordershistogram/?" + urllib.parse.urlencode(
+                   {"norender": 1, "country": "CN", "language": "zh",
+                    "currency": 23})),
+              ("market/search 非 render JSON 变体",
+               BASE + "/market/search/render/?" + urllib.parse.urlencode(
+                   {"appid": 730, "norender": 1, "count": 10, "start": 0,
+                    "query": "", "search_descriptions": 0,
+                    "sort_column": "popular", "sort_dir": "desc",
+                    "currency": 23, "country": "CN"})),
           ]
-          for label, pat in pats:
-              hits = re.findall(pat, text)
-              print("  %-24s %d 次  %s" %
-                    (label, len(hits), str(hits[:5]) if hits else ""))
-          print("")
-
-          # 关键：页面里所有 6~8 位数字带上下文
-          print("=== 6~8 位数字及上下文 ===")
-          seen = set()
-          for m in re.finditer(r"\b(\d{6,8})\b", text):
-              n = m.group(1)
-              if n in seen:
-                  continue
-              seen.add(n)
-              ctx = text[max(0, m.start() - 60):m.end() + 60]
-              ctx = ctx.replace("\n", " ").replace("\r", " ")
-              print("  %s │ %s" % (n, ctx))
-              if len(seen) >= 12:
-                  break
-          print("")
-
-          # 页面里所有 script 的 src / 内联 JSON
-          print("=== 内联 JSON / script 线索 ===")
-          for m in list(re.finditer(r"<script[^>]*>(.{0,300}?)</script>", text, re.S))[:8]:
-              body = m.group(1).strip()
-              if body:
-                  print("  %r" % body[:200])
-          print("")
-
-          print("=== 页面长度分布 / 是否 SPA 骨架 ===")
-          print("  <body 出现: %d" % text.count("<body"))
-          print("  app-root: %d" % text.count('id="app-root"'))
-          print("  window.SSR: %d" % text.count("SSR"))
-          print("  页面后 800 字符:")
-          print("  %r" % text[-800:])
+          for label, u in cands:
+              st, raw, dt = fetch(u, HDR)
+              print("  %-28s HTTP %-4s %5.1fs %r" %
+                    (label, st, dt, raw[:160]))
+              time.sleep(2)
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -137,5 +149,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r4: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r5: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
