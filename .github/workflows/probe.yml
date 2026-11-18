@@ -1,9 +1,8 @@
 name: probe
 
-# round 10（收官）：定容量模型。用真实生产节奏长时间打 priceoverview，
-# 看 10 分钟能拿到多少个物品，以及 429 之后会不会永远封死。
-# 顺便看 listings render 返回什么、orderbook 的 data 在 queryKey 之前还是之后。
-# 用完即删。
+# round 11（定案）：物品页已确认含完整盘口（amtMaxBuyOrder / amtMinSellOrder
+# / rgCompactBuyOrders）。这轮只回答一个问题：物品页能跑多快、能撑多少件。
+# 顺便验证解析器在真实 HTML 上是否稳定。用完即删。
 on:
   workflow_dispatch:
   push:
@@ -33,13 +32,6 @@ jobs:
           BASE = "https://steamcommunity.com"
           UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-          HDR = {
-              "User-Agent": UA,
-              "Accept": "application/json, text/plain, */*",
-              "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-              "X-Requested-With": "XMLHttpRequest",
-              "Referer": BASE + "/market/",
-          }
           HTML_HDR = {
               "User-Agent": UA,
               "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
@@ -53,7 +45,7 @@ jobs:
               urllib.request.HTTPCookieProcessor(jar))
 
 
-          def fetch(u, headers, timeout=40):
+          def fetch(u, headers, timeout=45):
               req = urllib.request.Request(u, headers=headers)
               t0 = time.time()
               try:
@@ -63,18 +55,59 @@ jobs:
                           raw = gzip.decompress(raw)
                       return r.status, raw, time.time() - t0
               except urllib.error.HTTPError as e:
-                  return e.code, e.read()[:400], time.time() - t0
+                  return e.code, e.read()[:300], time.time() - t0
               except Exception as e:
                   return None, str(e).encode(), time.time() - t0
 
 
-          def uz(raw):
-              if raw[:2] == b"\x1f\x8b":
-                  try:
-                      return gzip.decompress(raw).decode("utf-8", "replace")
-                  except Exception:
-                      pass
-              return raw.decode("utf-8", "replace")
+          OB_KEY = '"queryKey":["market","orderbook"'
+
+
+          def parse_orderbook(html):
+              """从物品页 HTML 抽盘口。返回 dict 或 None。"""
+              un = html.replace("\\\\", "\\").replace('\\"', '"')
+              i = un.find(OB_KEY)
+              if i < 0:
+                  return None
+              seg = un[max(0, i - 30000):i]
+              di = seg.rfind('"data":{"amtMaxBuyOrder"')
+              if di < 0:
+                  di = seg.rfind('"data":{')
+              if di < 0:
+                  return None
+              start = seg.find("{", di)
+              # 括号配对找结尾
+              depth, j, in_str, esc = 0, start, False, False
+              while j < len(seg):
+                  c = seg[j]
+                  if in_str:
+                      if esc:
+                          esc = False
+                      elif c == "\\":
+                          esc = True
+                      elif c == '"':
+                          in_str = False
+                  else:
+                      if c == '"':
+                          in_str = True
+                      elif c == "{":
+                          depth += 1
+                      elif c == "}":
+                          depth -= 1
+                          if depth == 0:
+                              break
+                  j += 1
+              try:
+                  return json.loads(seg[start:j + 1])
+              except Exception:
+                  return None
+
+
+          def flat_pairs(a):
+              """[价格, 件数, 价格, 件数 ...] → [(价格, 件数)]"""
+              if not isinstance(a, list):
+                  return []
+              return [(a[k], a[k + 1]) for k in range(0, len(a) - 1, 2)]
 
 
           print("=== 出口 IP ===")
@@ -85,104 +118,77 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          # ---------- A. listings render 返回什么 ----------
-          print("=== A. 单物品 listings render ===")
-          u = BASE + "/market/listings/730/Prisma%20Case/render/?" + \
-              urllib.parse.urlencode({"query": "", "start": 0, "count": 5,
-                                      "country": "CN", "language": "zh",
-                                      "currency": 23})
-          st, raw, dt = fetch(u, HDR)
-          body = uz(raw)
-          print("  HTTP %s %dB %.1fs  Content-Type 开头: %r"
-                % (st, len(raw), dt, body[:120]))
-          if body.lstrip().startswith("{"):
-              try:
-                  j = json.loads(body)
-                  print("  顶层键: %s" % sorted(j.keys()))
-                  for k, v in j.items():
-                      if isinstance(v, list) and v and isinstance(v[0], dict):
-                          print("  %s[0] 键: %s" % (k, sorted(v[0].keys())))
-                          print("  %s[0] = %s" % (k, json.dumps(v[0], ensure_ascii=False)[:500]))
-                      else:
-                          print("  %-16s = %s" % (k, str(v)[:120]))
-              except Exception as e:
-                  print("  解析失败 %s" % e)
-          print("")
-
-          # ---------- B. orderbook 的 data 在 queryKey 之前 ----------
-          print("=== B. 物品页 orderbook 的 state.data ===")
-          st, raw, dt = fetch(
-              BASE + "/market/listings/730/Prisma%20Case", HTML_HDR)
-          text = raw.decode("utf-8", "replace")
-          un = text.replace("\\\\", "\\").replace('\\"', '"')
-          i = un.find('"queryKey":["market","orderbook"')
-          print("  queryKey 位置: %d" % i)
-          if i > 0:
-              seg = un[max(0, i - 4000):i]
-              di = seg.rfind('"data":')
-              print("  往前找 data 位置(相对): %d" % di)
-              if di >= 0:
-                  print("  data 之后 1200 字符:")
-                  print("  %s" % seg[di:di + 1200])
+          # ---------- A. 解析器稳定性 + 正确性 ----------
+          print("=== A. 解析器验证（6 件不同价位） ===")
+          TEST = ["Prisma Case", "Fracture Case", "Kilowatt Case",
+                  "Gallery Case", "Dreams & Nightmares Case",
+                  "AWP | Asiimov (Field-Tested)"]
+          print("  %-34s %7s %7s %8s %8s %6s" %
+                ("物品", "求购分", "卖价分", "买单选", "卖单选", "买深度"))
+          for name in TEST:
+              u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
+              st, raw, dt = fetch(u, HTML_HDR)
+              if st != 200:
+                  print("  %-34s HTTP %s" % (name, st))
+                  time.sleep(3)
+                  continue
+              ob = parse_orderbook(raw.decode("utf-8", "replace"))
+              if not ob:
+                  print("  %-34s 解析失败 (%dB)" % (name, len(raw)))
               else:
-                  print("  往前 1200 字符（看 state 长什么样）:")
-                  print("  %s" % seg[-1200:])
+                  buys = flat_pairs(ob.get("rgCompactBuyOrders"))
+                  depth = sum(q for _, q in buys[:10])
+                  print("  %-34s %7s %7s %8s %8s %6d" %
+                        (name[:34], ob.get("amtMaxBuyOrder"),
+                         ob.get("amtMinSellOrder"), ob.get("cBuyOrders"),
+                         ob.get("cSellOrders"), depth))
+              time.sleep(3)
           print("")
 
-          # ---------- C. 10 分钟 sustained 吞吐 ----------
-          print("=== C. priceoverview sustained 测试（10 分钟，间隔 2.5s） ===")
+          # ---------- B. 吞吐：物品页 sustained ----------
+          print("=== B. 物品页 sustained（8 分钟，间隔 2.5s） ===")
           POOL = ["Prisma Case", "Fracture Case", "Recoil Case",
                   "Revolution Case", "Danger Zone Case", "Snakebite Case",
-                  "Kilowatt Case", "Gallery Case",
-                  "Dreams & Nightmares Case", "Operation Broken Fang Case",
-                  "Glove Case", "Chroma 2 Case", "Chroma 3 Case",
-                  "Spectrum Case", "Spectrum 2 Case", "Horizon Case",
-                  "Clutch Case", "Free Case", "Fever Case", "Shadow Case",
-                  "Gamma Case", "Gamma 2 Case", "Operation Hydra Case",
-                  "Operation Riptide Case", "Operation Wildfire Case",
-                  "CS20 Case", "Prisma 2 Case", "Fracture Case"]
-          GAP = 2.5
-          BUDGET = 600
-          t_start = time.time()
-          n = ok = r429 = r_other = 0
-          samples = []
-          idx = 0
-          # 记录每分钟的成功数，看是否存在节流
+                  "Kilowatt Case", "Gallery Case", "Glove Case",
+                  "Chroma 2 Case", "Chroma 3 Case", "Spectrum Case",
+                  "Spectrum 2 Case", "Horizon Case", "Clutch Case",
+                  "Free Case", "Fever Case", "Shadow Case", "Gamma Case",
+                  "Gamma 2 Case", "CS20 Case", "Prisma 2 Case",
+                  "Dreams & Nightmares Case", "Operation Broken Fang Case"]
+          GAP, BUDGET = 2.5, 480
+          t0 = time.time()
+          n = ok = bad = err = 0
           bucket = {}
-          while time.time() - t_start < BUDGET:
+          idx = 0
+          got_ob = 0
+          while time.time() - t0 < BUDGET:
               name = POOL[idx % len(POOL)]
               idx += 1
-              q = urllib.parse.urlencode({"appid": 730, "currency": 23,
-                                          "market_hash_name": name})
-              st, raw, dt = fetch(BASE + "/market/priceoverview/?" + q, HDR)
+              u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
+              st, raw, dt = fetch(u, HTML_HDR)
               n += 1
-              minute = int((time.time() - t_start) // 60)
-              bucket.setdefault(minute, [0, 0])
+              m = int((time.time() - t0) // 60)
+              bucket.setdefault(m, [0, 0])
               if st == 200:
                   ok += 1
-                  bucket[minute][0] += 1
-                  if len(samples) < 3:
-                      samples.append((name, uz(raw)[:110]))
-              elif st == 429:
-                  r429 += 1
-                  bucket[minute][1] += 1
+                  bucket[m][0] += 1
+                  if parse_orderbook(raw.decode("utf-8", "replace")):
+                      got_ob += 1
               else:
-                  r_other += 1
-                  bucket[minute][1] += 1
-                  if r_other <= 2:
+                  bucket[m][1] += 1
+                  if st != 429 and err < 2:
+                      err += 1
                       print("  非429: HTTP %s %r" % (st, raw[:100]))
               time.sleep(GAP)
-
-          elapsed = time.time() - t_start
-          print("  总请求 %d  成功 %d  (%.1f%%)  429 %d  其他 %d  用时 %.0fs"
-                % (n, ok, 100.0 * ok / max(n, 1), r429, r_other, elapsed))
-          print("  有效速率: %.1f 件/分钟" % (ok / (elapsed / 60.0)))
-          print("")
+          el = time.time() - t0
+          print("  总 %d  成功 %d (%.0f%%)  失败 %d  用时 %.0fs"
+                % (n, ok, 100.0 * ok / max(n, 1), n - ok, el))
+          print("  解析出盘口 %d/%d" % (got_ob, ok))
+          print("  有效速率: %.1f 件/分钟 → 10 分钟 %.0f 件"
+                % (ok / (el / 60.0), ok / (el / 60.0) * 10))
           print("  每分钟 [成功, 失败]:")
           for m in sorted(bucket):
               print("    第 %2d 分: %s" % (m, bucket[m]))
-          print("")
-          print("  样例: %s" % samples)
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -197,5 +203,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r10: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r11: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
