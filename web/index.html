@@ -55,6 +55,8 @@ th .arw{font-size:9px;margin-left:2px}
 th.name,td.name{text-align:left;white-space:normal;width:99%}
 td.name a{color:var(--txt);text-decoration:none}
 td.name a:hover{color:var(--acc)}
+td.name .en{display:block;font-size:10.5px;color:var(--dim);margin-top:1px;
+  word-break:break-all;line-height:1.25}
 .star{cursor:pointer;user-select:none;margin-right:7px;color:#3a4150;font-size:13px}
 .star:hover{color:var(--warn)}
 .star.on{color:var(--warn)}
@@ -200,6 +202,47 @@ function steamUrl(name){
   return 'https://steamcommunity.com/market/listings/730/'+encodeURIComponent(name);
 }
 
+/* ---- 中文名 ----
+   data/zh.json 是 tools/build_zh_names.py 从 ByMykel/CSGO-API 生成的查表：
+     wear  {英文磨损: 中文}
+     skins {不带磨损的基名: 中文}   "AWP | Asiimov" -> "AWP | 二西莫夫"
+     flat  {完整名: 中文}           "Prisma Case" -> "棱彩武器箱"
+   之所以存基名而不是完整名：完整名两万多条要 2.1 MB，这张表只有 318 KB，
+   磨损和 StatTrak/纪念品前缀都能从物品名里拆出来再拼回去。
+   查不到就退回英文名，不要显示成空白。 */
+let ZH = null;
+const STAR = '\u2605 ';
+const PREFIX = [['StatTrak\u2122 ', 'StatTrak\u2122 '], ['Souvenir ', '\u7eaa\u5ff5\u54c1 ']];
+
+function zhName(name){
+  if(!ZH || !name) return null;
+  let s = name, star = '';
+  if(s.startsWith(STAR)){ star = STAR; s = s.slice(STAR.length); }
+  let pre = '';
+  for(const p of PREFIX){
+    if(s.startsWith(p[0])){ pre = p[1]; s = s.slice(p[0].length); break; }
+  }
+  let wear = '';
+  if(s.endsWith(')') && s.includes(' (')){
+    const i = s.lastIndexOf(' (');
+    const w = ZH.wear[s.slice(i+2, -1)];
+    if(w){ s = s.slice(0, i); wear = '\uff08' + w + '\uff09'; }
+  }
+  const key = star + s;
+  const zh = ZH.skins[key] || ZH.flat[key];
+  return zh ? pre + zh + wear : null;
+}
+
+/* 查表是 318 KB 的额外请求。加载失败不影响主表 —— 名字退回英文而已，
+   所以这里吞掉异常，不往上抛。 */
+async function loadZh(){
+  const q = new URLSearchParams(location.search);
+  try{
+    const r = await fetch(q.get('zh') || 'data/zh.json', {cache:'no-store'});
+    if(r.ok) ZH = await r.json();
+  }catch(e){ /* 没有就用英文名 */ }
+}
+
 /* ---- 筛选条件存进地址栏：刷新不丢，也能直接把链接发给别人 ---- */
 const FIELDS = ['fQ','fRatio','fDepth','fMin','fMax','fSrc','fDisc'];
 const URL_KEY = {fQ:'q', fRatio:'r', fDepth:'d', fMin:'pmin', fMax:'pmax',
@@ -236,6 +279,8 @@ function writeUrl(){
 
 /* ---- 数据 ---- */
 async function load(){
+  // 先拿中文名查表：它决定物品列怎么显示，晚到会闪一下英文
+  await loadZh();
   // 优先读构建时同目录的 latest.json；允许 ?api=xxx 覆盖
   const q = new URLSearchParams(location.search);
   const src = q.get('api') || 'data/latest.json';
@@ -281,13 +326,16 @@ function view(){
   const src  = $('fSrc').value;
   const words = $('fQ').value.toLowerCase().split(/\s+/).filter(Boolean);
   const d = disc();
+  // 搜索同时匹配中文名和英文名：中文用户会直接搜「红线」，英文用户搜 redline，
+  // 只认一种就会让人以为搜不到东西
+  const hay = it => (it.n + ' ' + (zhName(it.n) || '')).toLowerCase();
   return RAW
     .filter(it => (it.ratio ?? 0) >= rMin
                && (it.depth ?? 0) >= dMin
                && (it.buy ?? 0) >= pMin && (it.buy ?? 0) <= hi
                && (!src || it.src === src)
                && (!FAVONLY || FAV.has(it.n))
-               && words.every(w => String(it.n).toLowerCase().includes(w)))
+               && words.every(w => hay(it).includes(w)))
     .map(it => ({...it,
       real: (it.net != null && it.buy != null) ? it.net*d - it.buy : null}))
     .sort((a,b) => {
@@ -322,7 +370,7 @@ function kpi(rows, d){
   add('面值比中位', fmt(med, 3), med >= crit ? 'good' : (med >= 1 ? 'mid' : 'bad'));
   add('折现后能赚', `${win.length} 件`, win.length ? 'good' : 'bad');
   if(best && best.real != null)
-    add('最好', `${best.real >= 0 ? '+' : ''}¥${fmt(best.real)}（${best.n}）`,
+    add('最好', `${best.real >= 0 ? '+' : ''}¥${fmt(best.real)}（${zhName(best.n) || best.n}）`,
         best.real >= 0 ? 'good' : 'bad');
   add('临界面值比', fmt(crit, 3),
       'mid');
@@ -434,9 +482,12 @@ function render(){
     star.dataset.n = it.n;
     star.title = FAV.has(it.n) ? '取消收藏' : '收藏';
     tdN.appendChild(star);
-    const a = el('a', null, it.n); a.href = steamUrl(it.n);
+    const zh = zhName(it.n);
+    const a = el('a', null, zh || it.n); a.href = steamUrl(it.n);
     a.target = '_blank'; a.rel = 'noopener noreferrer';
-    tdN.appendChild(a);
+    // 中文名在上面，英文原名留在 title 里 —— 去 Steam 搜、跟人核对都要认英文名
+    if(zh){ a.title = it.n; tdN.appendChild(a); tdN.appendChild(el('span','en', it.n)); }
+    else tdN.appendChild(a);
     if(it.src) tdN.appendChild(el('span','ptag', it.src));
     tr.appendChild(tdN);
 
@@ -480,12 +531,13 @@ function csvCell(v){
 function exportCsv(){
   const rows = view();
   const d = disc();
-  const head = ['物品','面值比_求购价','面值比_挂单价','折现净额','买入价','Steam净得',
-                '求购价','最低挂单','买盘深度','第三方库存','数据源','面值比_临界'];
+  const head = ['物品','物品_英文原名','面值比_求购价','面值比_挂单价','折现净额','买入价',
+                'Steam净得','求购价','最低挂单','买盘深度','第三方库存','数据源','面值比_临界'];
   const out = [head.map(csvCell).join(',')];
   for(const r of rows){
     out.push([
-      r.n, fmt(r.ratio,4), r.ratio_sell!=null?fmt(r.ratio_sell,4):'',
+      zhName(r.n) || r.n, r.n,
+      fmt(r.ratio,4), r.ratio_sell!=null?fmt(r.ratio_sell,4):'',
       r.real!=null?fmt(r.real,2):'', fmt(r.buy,2), fmt(r.net,2),
       r.bid!=null?fmt(r.bid,2):'', r.sell!=null?fmt(r.sell,2):'',
       r.depth ?? '', r.qty ?? '', r.src || '', fmt(1/d,4)

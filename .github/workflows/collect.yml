@@ -265,6 +265,15 @@ jobs:
 
       # 采集完顺手把静态页发到 Pages。这样只用一个 workflow：
       # 数据更新和页面更新永远同步，不会出现页面比数据新/旧的问题。
+      - name: 更新中文名查表
+        run: |
+          set +e
+          # CSGO-API 出新的物品时这张表才需要变，所以失败不算错 ——
+          # build_site.py 发现没有 zh.json 只会让物品名显示成英文。
+          # 从 runner 直连 github.com（本机连不上，见 README）。
+          python tools/build_zh_names.py --out data/zh.json
+          echo "生成 exit=$?"
+
       - name: 构建静态页
         env:
           ARB_DATA: /tmp/arbdata/data

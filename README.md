@@ -29,7 +29,8 @@ collector/
 web/index.html      静态前端（单文件，无依赖）
 build_site.py       拼出可发布的 _site/
 serve.py            本地预览（web/ + data/）
-data/               本地开发用：arb.db、latest.json、shards/
+tools/build_zh_names.py  从 CSGO-API 生成物品中文名查表 data/zh.json
+data/               本地开发用：arb.db、latest.json、zh.json、shards/
 .github/workflows/collect.yml   4 路采集 + 汇总 + 部署
 ```
 
@@ -43,7 +44,7 @@ python collector/run.py --mode fake
 python serve.py
 # 打开 http://127.0.0.1:8770
 
-# 3. 自检（53 项，全离线）
+# 3. 自检（100 项，全离线）
 python selftest.py
 
 # 4. 真实采集（这台机器连不上 Steam，Steam 部分会失败，第三方能通）
@@ -80,6 +81,58 @@ pub_fee   = max(1, floor(net × 10%))
 
 「面值比」还有两列：按 Steam **最高求购价**秒卖（`ratio`），和按**最低挂单价**
 排队（`ratio_sell`）。前者立刻成交但价低，后者价高但可能等很久。
+
+## 物品中文名
+
+价格数据里存的是 Steam 的 `market_hash_name`（`AWP | Asiimov (Field-Tested)`）。
+中文名不来自 Steam，来自 [ByMykel/CSGO-API](https://github.com/ByMykel/CSGO-API)，
+由 `tools/build_zh_names.py` 生成 `data/zh.json`。
+
+为什么不在运行时问 Steam：物品页在机房 IP 上常年 429（见下面的死活表），
+一页几百件物品就是几百次请求，纯烧限额。
+
+**存的是「基名」不是完整名。** `skins.json` 里 2246 条的名字不带磨损
+（`AWP | Asiimov`），磨损单独给在每条自己的 `wears` 数组里。所以表分两张：
+
+```
+wear  {"Field-Tested": "久经沙场", ...}
+skins {"AWP | Asiimov": "AWP | 二西莫夫", ...}        1974 条
+flat  {"Prisma Case": "棱彩武器箱", ...}               1956 条
+```
+
+前端 `zhName()` 按顺序拆名字再拼回去：
+
+```
+StatTrak™ AWP | Asiimov (Field-Tested)
+  → 前缀 StatTrak™ 原样        （Souvenir 要翻成「纪念品」）
+  → 基名 AWP | Asiimov 查表    → AWP | 二西莫夫
+  → 磨损 (Field-Tested) 查表   → （久经沙场）
+  → StatTrak™ AWP | 二西莫夫（久经沙场）
+```
+
+**剥前缀的顺序不能换**：`★` 要最先剥出来但**留在查表用的 key 里**，
+因为刀具手套的中文名自带「（★）」—— `★ Karambit | Fade` 查的是
+`★ Karambit | Fade`，得到「爪子刀（★） | 渐变之色」。
+`★ StatTrak™ Karambit | Doppler` 则要先把 ★ 摘掉、剥掉 StatTrak、再拼回 ★。
+
+**为什么存基名：** 展开成两万多条完整名要 2.1 MB，基名表只有 318 KB。
+差 1.8 MB，为了一个查表不值得。
+
+**查不到就退回英文名**（`zhName()` 返回 `null`，原样显示 `it.n`），
+不显示空白。`title` 属性里始终留着英文原名 —— 去 Steam 搜、跟人核对都要认英文名。
+搜索框同时匹配中英文，搜「红线」和 `redline` 都能出 `AK-47 | Redline`。
+
+**本机没法重新生成**：`raw.githubusercontent.com` / `cdn.jsdelivr.net` 都不通，
+GitHub 的 blobs API 拿 4.9 MB 文件会在 571 KB 处截断。CI 里能直连 github.com，
+所以生成这一步放在 workflow 的「更新中文名查表」，**失败不算错**（只是名字退回英文）。
+
+想本地重新生成，先自己把仓库弄下来，再传 `--src`：
+
+```bash
+git clone --depth 1 --filter=blob:none --sparse git@github.com:ByMykel/CSGO-API.git csgoapi
+git -C csgoapi sparse-checkout set public/api/en public/api/zh-CN
+python tools/build_zh_names.py --out data/zh.json --src csgoapi
+```
 
 ## 接口：哪些活、哪些死
 

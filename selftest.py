@@ -840,6 +840,77 @@ def t_fetch_code():
         steam.urllib.request.urlopen = real
 
 
+# ---------------- 中文名查表 ----------------
+
+STAR = "★ "
+PREFIX = (("StatTrak™ ", "StatTrak™ "), ("Souvenir ", "纪念品 "))
+
+
+def zh_resolve(zh, name):
+    """照 web/index.html 的 zhName() 写的一份镜像。
+
+    顺序不能换：先剥 ★（刀具手套的中文名自带「（★）」，得留在基名里查），
+    再剥 StatTrak/纪念品前缀，最后剥磨损后缀 —— 磨损在名字最外面。
+    """
+    s = name
+    star = ""
+    if s.startswith(STAR):
+        star, s = STAR, s[len(STAR):]
+    pre = ""
+    for p_en, p_zh in PREFIX:
+        if s.startswith(p_en):
+            pre, s = p_zh, s[len(p_en):]
+            break
+    wear = ""
+    if s.endswith(")") and " (" in s:
+        i = s.rindex(" (")
+        w = zh["wear"].get(s[i + 2:-1])
+        if w:
+            s, wear = s[:i], "（" + w + "）"
+    key = star + s
+    out = zh["skins"].get(key) or zh["flat"].get(key)
+    return (pre + out + wear) if out else None
+
+
+def t_zh_names():
+    print("\n中文名查表")
+    fp = os.path.join(HERE, "data", "zh.json")
+    if not os.path.exists(fp):
+        check("zh.json 存在（没有就用英文名，不算错）", True, "文件不存在，跳过")
+        return
+    with io.open(fp, encoding="utf-8") as f:
+        zh = json.load(f)
+    check("有磨损表", set(zh.get("wear", {})) >= {
+        "Factory New", "Minimal Wear", "Field-Tested", "Well-Worn", "Battle-Scarred"})
+    check("有基名表和完整名表", bool(zh.get("skins")) and bool(zh.get("flat")),
+          "%s / %s" % (len(zh.get("skins") or {}), len(zh.get("flat") or {})))
+    # 展开后的完整名要能覆盖两万多条，但表本身只有三千多条 —— 靠这里证明展开是对的
+    check("AWP | Asiimov 能查到", zh.get("skins", {}).get("AWP | Asiimov") == "AWP | 二西莫夫")
+    check("箱子能查到", zh.get("flat", {}).get("Prisma Case") == "棱彩武器箱")
+    check("磨损后缀转成中文括号",
+          zh_resolve(zh, "AK-47 | Redline (Field-Tested)") == "AK-47 | 红线（久经沙场）")
+    check("StatTrak 前缀保留、只翻基名",
+          zh_resolve(zh, "StatTrak™ AK-47 | Redline (Field-Tested)")
+          == "StatTrak™ AK-47 | 红线（久经沙场）")
+    check("纪念品前缀翻成中文",
+          zh_resolve(zh, "Souvenir AWP | Asiimov (Field-Tested)")
+          == "纪念品 AWP | 二西莫夫（久经沙场）")
+    # ★ 要在查表用的 key 里，不能剥掉就丢 —— 刀具的中文名是「爪子刀（★）」
+    check("★ 留在查表键里",
+          zh_resolve(zh, "★ Karambit | Fade (Factory New)")
+          == "爪子刀（★） | 渐变之色（崭新出厂）")
+    check("查不到返回 None，不返回半个名字",
+          zh_resolve(zh, "Made Up | Thing (Factory New)") is None)
+
+    latest = os.path.join(HERE, "data", "latest.json")
+    if os.path.exists(latest):
+        with io.open(latest, encoding="utf-8") as f:
+            items = json.load(f).get("items") or []
+        miss = [it["n"] for it in items if zh_resolve(zh, it["n"]) is None]
+        check("线上物品全部能查到中文名", not miss,
+              "缺 %d/%d：%s" % (len(miss), len(items), miss[:5]))
+
+
 def main():
     t_fees()
     t_price()
@@ -854,6 +925,7 @@ def main():
     t_net_give_up()
     t_fetch_code()
     t_fx_reuse()
+    t_zh_names()
     t_shards()
     t_deadline()
     t_fake()

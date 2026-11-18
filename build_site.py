@@ -11,6 +11,7 @@ CI 里由 collect.yml 调它（ARB_DATA 指向 /tmp/arbdata/data），
 产物：
   _site/index.html
   _site/data/latest.json
+  _site/data/zh.json      （物品中文名查表，缺了页面退回英文名）
 
 也可以本地跑完直接看 _site/index.html（需要起个静态服务器，
 因为 fetch 读本地 file:// 会被浏览器拦）。
@@ -44,6 +45,19 @@ def main() -> int:
     size = os.path.getsize(os.path.join(dst_dir, "latest.json")) / 1024
     print(f"已构建 {OUT}")
     print(f"  latest.json {size:.1f} KB")
+
+    # 中文名查表。不是每轮都变（CSGO-API 出新的才变），缺了不影响页面能用，
+    # 只是物品名退回英文，所以找不到只警告不算失败。
+    # 先看 ARB_DATA（CI 里 data 分支被 checkout 到 /tmp），再退回仓库自己的 data/
+    for zh in (os.path.join(DATA, "zh.json"),
+               os.path.join(BASE, "data", "zh.json")):
+        if os.path.exists(zh):
+            shutil.copy2(zh, os.path.join(dst_dir, "zh.json"))
+            print(f"  zh.json {os.path.getsize(zh) / 1024:.1f} KB")
+            break
+    else:
+        print("警告：没找到 zh.json，物品名会显示成英文"
+              "（跑 python tools/build_zh_names.py 生成）")
     return 0
 
 
