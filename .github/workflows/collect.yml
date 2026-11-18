@@ -144,7 +144,13 @@ jobs:
           # 折算比标定要问 Steam 的 priceoverview（每样本 2 次请求），
           # 6 个样本 = 12 次，几十秒。
           python run.py --mode merge --in-dir /tmp/shards --fx-samples 6
-          echo "合并 exit=$?"
+          code=$?
+          echo "合并 exit=$code"
+          # 退出码留在文件里给汇总那步看。不 exit 1 是为了让后面的
+          # 「回写 data 分支」照跑（库里旧数据还有用），但崩了必须说出来 ——
+          # 有一回 run_merge 抛 NameError，因为这步 exit 0，Summary 全绿、
+          # 页面上还是旧数字，查了很久才发现。
+          echo "$code" > /tmp/merge.exit
           ls -la "$ARB_DATA"
           exit 0
 
@@ -210,6 +216,18 @@ jobs:
               print("")
               print("**❌ %s**" % msg)
               print("::error::%s" % msg)
+
+          # 合并那步的退出码。它自己 exit 0 是为了不让后面回写中断，
+          # 但崩了要在这里标出来，否则 Summary 全绿而数字没更新。
+          try:
+              mcode = int(open("/tmp/merge.exit").read().strip())
+          except Exception:
+              mcode = None
+          if mcode:
+              print("")
+              print("**❌ 合并入库那步崩了（exit %d）—— 上面的数字可能是旧的，"
+                    "去 log 里看 traceback**" % mcode)
+              print("::error::合并入库崩溃 exit %d" % mcode)
           top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
           if top:
               print("")
