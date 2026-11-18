@@ -15,10 +15,12 @@ name: collect
 #   * 数据存在 data 分支，merge job 每轮 fetch 下来、算完 push 回去（depth=1）
 
 on:
-  schedule:
-    # 每 30 分钟一轮。一轮实际 10~15 分钟，间隔比耗时短的话队列会越堆越多，
-    # 最后全是排队等超时的废跑。
-    - cron: "*/30 * * * *"
+  # 定时先关掉。2026-11-18 连续 8 轮物品页全是 429 / HTTP 0、一件没采到，
+  # 这种情况下每 30 分钟重试一次只是白烧 runner，还要跟着 push 一遍 data
+  # 分支上的空结果。等接口恢复、或者换了出口再说 —— 手动点 Run workflow
+  # 照样能跑一轮看情况。
+  # schedule:
+  #   - cron: "*/30 * * * *"
   workflow_dispatch:        # 允许手动点一次，方便第一次验证
   push:
     branches: [main]
