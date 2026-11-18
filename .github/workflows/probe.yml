@@ -1,8 +1,17 @@
 name: probe
 
-# 临时探针 v3：物品页在「大间隔」下能不能稳定拿到。
-# 已知：单发物品页 200（544KB），连打 2.5 秒间隔全 429。
-# 那就量一下间隔和成功率的关系，好定 STEAM_GAP。
+# 临时探针 v4：查清「哪些请求会被 429」。
+#
+# 已知事实：
+#   * 探针 v2：同一台 runner、同一时刻，priceoverview 429（122ms），
+#     物品页 market/listings/730/Prisma Case 200（544KB，362ms）。
+#   * collect 真跑：4 个 shard 各打 10 次，全部 429，0/40 成功。
+#   * 探针 v3 想量间隔，但抓候选太慢（waxpeer 两万七千条），
+#     20 分钟跑不完被取消。
+#
+# 所以这版不抓候选，直接用写死的物品名，只打 9 次，两分钟内出结果。
+# 要回答的是：普通箱子 vs 粗排前列的稀有物品，限流是否不同；
+# 以及冷却一分钟后能不能恢复。
 on:
   workflow_dispatch:
   push:
@@ -18,7 +27,7 @@ env:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@v4
 
@@ -34,57 +43,57 @@ jobs:
           python - <<'PY'
           import json, os, sys, time
           sys.path.insert(0, os.getcwd())
-          import run, steam as st
+          import steam as st
 
-          cand = run.fetch_candidates("probe ")
-          ranked = run.pick_candidates(cand) if cand else []
-          print("候选 %d，粗排后 %d" % (len(cand or {}), len(ranked)))
-          if not ranked:
-              sys.exit(0)
+          # 第一组：普通箱子，谁都能开，探针 v2 里这类能拿到 200
+          common = ["Prisma Case", "Fracture Case",
+                    "Dreams & Nightmares Case"]
+          # 第二组：粗排前列的稀有物品，collect 真跑里打的就是这类
+          rare = ["★ Butterfly Knife | Crimson Web (Minimal Wear)",
+                  "M4A1-S | Imminent Danger (Well-Worn)",
+                  "★ Karambit | Night (Factory New)"]
 
-          # 每种间隔试 6 件，从池子里挑不同物品避免重复命中缓存
-          # 第四组先干等 90 秒再按 2.5 秒间隔打 3 件，用来分辨限流是
-          # 「按速率算」还是「窗口式」：前者冷却后仍然会撞，后者冷却后能过。
-          plans = [(2.5, 6, 0), (8.0, 6, 0), (15.0, 6, 0), (2.5, 3, 90)]
-          results = []
-          idx = 0
-          for gap, n, cool in plans:
-              if cool:
-                  print("  冷却 %d 秒…" % cool)
-                  time.sleep(cool)
-              st.LIMITER.gap = gap
-              st.LIMITER.strikes = 0
-              ok = bad = 0
-              errs = []
+          def one(name, tag):
+              url = (st.BASE + "/market/listings/730/"
+                     + st.urllib.parse.quote(name, safe=""))
               t0 = time.monotonic()
-              for _ in range(n):
-                  if idx >= len(ranked):
-                      break
-                  hn = ranked[idx]; idx += 1
-                  try:
-                      ob = st.item_orderbook(hn)
-                      ok += 1
-                      print("  gap=%.1f  %-40s OK  bid=%s sell=%s" % (
-                          gap, hn[:40], ob["usd_bid"], ob["usd_sell"]))
-                  except Exception as e:
-                      bad += 1
-                      errs.append(type(e).__name__ + ":" + str(e)[:40])
-                      print("  gap=%.1f  %-40s %s" % (gap, hn[:40], type(e).__name__))
-              el = time.monotonic() - t0
-              row = {"gap": gap, "ok": ok, "bad": bad, "cool": cool,
-                     "seconds": round(el, 1),
-                     "rate": round(ok / el * 60, 1) if el > 0 else 0,
-                     "errs": errs[:4]}
-              results.append(row)
-              print("  → gap=%.1f cool=%d 成功 %d/%d  %.0fs  %.1f 件/分" % (
-                  gap, cool, ok, n, el, row["rate"]))
+              code, raw = st._fetch(url, st.HTML_HEADERS,
+                                    timeout=st.FETCH_TIMEOUT, retries=0)
+              ms = round((time.monotonic() - t0) * 1000)
+              print("  %-6s %-45s code=%-4s %5sms %7s bytes" % (
+                  tag, name[:45], code, ms, len(raw)))
+              return {"tag": tag, "name": name, "code": code,
+                      "ms": ms, "bytes": len(raw)}
 
-          out = {"results": results,
-                 "summary": "; ".join("gap%.1f/cool%d: %d/%d" % (
-                     r["gap"], r["cool"], r["ok"], r["ok"] + r["bad"])
-                     for r in results)}
+          rows = []
+
+          print("第一组：普通箱子，间隔 5 秒")
+          for n in common:
+              rows.append(one(n, "common"))
+              time.sleep(5)
+
+          print("第二组：稀有物品，间隔 5 秒")
+          for n in rare:
+              rows.append(one(n, "rare"))
+              time.sleep(5)
+
+          print("冷却 60 秒…")
+          time.sleep(60)
+
+          print("第三组：普通箱子复打，间隔 5 秒")
+          for n in common:
+              rows.append(one(n, "again"))
+              time.sleep(5)
+
+          codes = {}
+          for r in rows:
+              k = "%s:%s" % (r["tag"], r["code"])
+              codes[k] = codes.get(k, 0) + 1
+          out = {"rows": rows, "codes": codes,
+                 "summary": " ".join("%s=%d" % (k, v)
+                                     for k, v in sorted(codes.items()))}
           print("\n" + out["summary"])
-          fp = os.path.join(os.environ.get("OUT_DIR", "/tmp/probelog"), "probe.json")
+          fp = os.path.join(os.environ["OUT_DIR"], "probe.json")
           with open(fp, "w", encoding="utf-8") as f:
               json.dump(out, f, ensure_ascii=False, indent=1)
           print("写了", fp)
@@ -99,6 +108,6 @@ jobs:
           git config user.email probe@local
           git checkout -q -b probe-log
           git add -A
-          git commit -q -m "probe v3 $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
+          git commit -q -m "probe v4 $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push -q -f origin probe-log
