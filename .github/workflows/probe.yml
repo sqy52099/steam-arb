@@ -1,7 +1,9 @@
 name: probe
 
-# 临时探针：只为了回答一个问题 —— priceoverview 在 runner 出口上能不能
-# 稳定连打。用完就删。
+# 临时探针 v2，回答两个问题：
+#   1. priceoverview 到底怎么失败的（超时？403？还是别的）
+#   2. 非 Azure 出口（公共代理）能不能拿到 Steam 数据
+# 用完就删。
 on:
   workflow_dispatch:
   push:
@@ -17,7 +19,7 @@ env:
 jobs:
   probe:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
 
@@ -26,77 +28,95 @@ jobs:
           python-version: "3.12"
 
       - name: 探针
-        env:
-          STEAM_GAP: "2.5"
         run: |
           set +e
           mkdir -p "$OUT_DIR"
           cd collector
           python - <<'PY'
-          import json, os, sys, time
+          import json, os, socket, sys, time, urllib.error, urllib.parse, urllib.request
           sys.path.insert(0, os.getcwd())
-          import run, thirdparty, steam as st
+          import run
 
-          cand = run.fetch_candidates("probe ")
-          if not cand:
-              print("拿不到第三方候选")
-              sys.exit(0)
-          ranked = run.pick_candidates(cand)
-          names = ranked[:45]
-          print("候选 %d，粗排后 %d，测前 %d" % (len(cand), len(ranked), len(names)))
+          UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+          out = {}
 
-          rows = []
-          ok = n429 = other = 0
-          t0 = time.monotonic()
-          for hn in names:
-              if time.monotonic() - t0 > 420:
-                  print("  时间到，停")
-                  break
+          # ---------- 1. 直连 Steam，看具体错误 ----------
+          def probe(url, timeout=12):
+              req = urllib.request.Request(url, headers={
+                  "User-Agent": UA,
+                  "Accept": "application/json, text/plain, */*",
+                  "Accept-Language": "zh-CN,zh;q=0.9",
+              })
+              t0 = time.monotonic()
               try:
-                  po = st.price_overview(hn)
-                  if po and po.get("lowest"):
-                      ok += 1
-                      rows.append({"n": hn, "lowest": po["lowest"],
-                                   "median": po.get("median"),
-                                   "vol": po.get("volume")})
-                  else:
-                      other += 1
-              except st.RateLimited:
-                  n429 += 1
-              except Exception:
-                  other += 1
-              if ok >= 30:
-                  break
+                  with urllib.request.urlopen(req, timeout=timeout) as r:
+                      body = r.read()
+                      return {"code": r.status, "ms": round((time.monotonic()-t0)*1000),
+                              "bytes": len(body), "head": body[:120].decode("utf-8","replace")}
+              except urllib.error.HTTPError as e:
+                  return {"code": e.code, "ms": round((time.monotonic()-t0)*1000),
+                          "err": "HTTPError", "head": (e.read()[:120] or b"").decode("utf-8","replace")}
+              except Exception as e:
+                  return {"code": 0, "ms": round((time.monotonic()-t0)*1000),
+                          "err": type(e).__name__, "head": str(e)[:120]}
 
-          el = time.monotonic() - t0
-          rate = (ok / el * 60) if el > 0 else 0
-          summary = "成功 %d · 429 %d · 其他 %d · 耗时 %.0fs · %.1f 件/分" % (
-              ok, n429, other, el, rate)
-          print(summary)
+          po_url = ("https://steamcommunity.com/market/priceoverview/"
+                    "?appid=730&currency=23&market_hash_name=" +
+                    urllib.parse.quote("Prisma Case"))
+          item_url = ("https://steamcommunity.com/market/listings/730/" +
+                      urllib.parse.quote("Prisma Case"))
 
-          # 数据质量：拿粗排的预估比率对比真实中间价，看中间价靠不靠谱
-          detail = []
-          for r in rows[:12]:
-              c = cand.get(r["n"]) or {}
-              buy = c.get("buy_cny") or 0
-              mid = r.get("median") or r.get("lowest") or 0
-              est = run.est_ratio(c) if c else None
-              real = None
-              if buy > 0 and mid > 0:
-                  real = run.fees.net_from_buyer(mid) / buy
-              detail.append({"n": r["n"], "buy": buy,
-                             "po_mid": mid, "po_low": r.get("lowest"),
-                             "vol": r.get("vol"),
-                             "src_mid": c.get("steam_mid_cny"),
-                             "est": est, "real": real})
-              print("  %-42s buy %8.2f po_mid %9.2f src_mid %9s est %s real %s" % (
-                  r["n"][:42], buy, mid, c.get("steam_mid_cny"),
-                  ("%.3f" % est) if est else "-",
-                  ("%.3f" % real) if real else "-"))
+          direct = {}
+          for tag, u in (("priceoverview", po_url), ("itempage", item_url)):
+              r = probe(u)
+              direct[tag] = r
+              print("直连 %-14s code=%s %sms %s" % (tag, r["code"], r["ms"], r.get("err","")))
+          out["direct"] = direct
 
-          out = {"summary": summary, "ok": ok, "n429": n429,
-                 "other": other, "seconds": round(el, 1),
-                 "rate_per_min": round(rate, 1), "rows": detail}
+          # ---------- 2. 出口 IP 是谁 ----------
+          for tag, u in (("ip", "https://api.ipify.org?format=json"),
+                         ("cf", "https://www.cloudflare.com/cdn-cgi/trace")):
+              r = probe(u, timeout=10)
+              print("出口 %-4s code=%s %s" % (tag, r["code"], (r.get("head") or "")[:90]))
+              out.setdefault("egress", {})[tag] = r
+
+          # ---------- 3. 公共代理能不能拿到 Steam ----------
+          # 这些跑在 AWS / Vercel / 别的云上，出口和 Azure 完全不同。
+          # 只用来回答「换出口有没有用」，不是要拿它们做生产。
+          enc_item = urllib.parse.quote(item_url, safe="")
+          enc_po = urllib.parse.quote(po_url, safe="")
+          proxies = [
+              ("allorigins-po", "https://api.allorigins.win/raw?url=" + enc_po),
+              ("allorigins-item", "https://api.allorigins.win/raw?url=" + enc_item),
+              ("codetabs-po", "https://api.codetabs.com/v1/proxy?quest=" + enc_po),
+              ("codetabs-item", "https://api.codetabs.com/v1/proxy?quest=" + enc_item),
+              ("corsproxy-po", "https://corsproxy.io/?url=" + enc_po),
+          ]
+          pres = {}
+          for tag, u in proxies:
+              r = probe(u, timeout=25)
+              ok = ""
+              h = r.get("head") or ""
+              if '"success"' in h or "lowest_price" in h:
+                  ok = " ★拿到价格"
+              elif "amtMaxBuyOrder" in h:
+                  ok = " ★拿到盘口"
+              print("代理 %-16s code=%s %sms%s" % (tag, r["code"], r["ms"], ok))
+              pres[tag] = r
+          out["proxies"] = pres
+
+          # ---------- 4. 汇总 ----------
+          good = [k for k, v in pres.items() if v.get("code") == 200]
+          out["summary"] = {
+              "direct_po_code": direct["priceoverview"]["code"],
+              "direct_item_code": direct["itempage"]["code"],
+              "proxy_ok": good,
+          }
+          print("\n直连 priceoverview:", direct["priceoverview"]["code"],
+                "| 物品页:", direct["itempage"]["code"],
+                "| 代理可用:", good or "无")
+
           fp = os.path.join(os.environ.get("OUT_DIR", "/tmp/probelog"), "probe.json")
           with open(fp, "w", encoding="utf-8") as f:
               json.dump(out, f, ensure_ascii=False, indent=1)
@@ -107,12 +127,11 @@ jobs:
         run: |
           set -e
           cd "$OUT_DIR"
-          ls -la
           git init -q
           git config user.name probe
           git config user.email probe@local
           git checkout -q -b probe-log
           git add -A
-          git commit -q -m "probe $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
+          git commit -q -m "probe v2 $(date -u +%Y-%m-%dT%H:%MZ)" || echo "没有变化"
           git remote add origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git push -q -f origin probe-log
