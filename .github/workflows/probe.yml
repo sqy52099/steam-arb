@@ -1,9 +1,9 @@
 name: probe
 
-# round 12：物品页内嵌盘口到底是美元分还是人民币分？
-#   Prisma Case amtMaxBuyOrder=117，但 priceoverview 最低价 ¥7.96
-#   → 117 分若是人民币就离谱（¥1.17），若是美元则 $1.17≈¥8.3 合理。
-# 同时测 cookie steamCurrency 能不能把盘口换成人民币。用完即删。
+# round 13：能不能直接拿到「人民币盘口」？
+#   物品页内嵌的 orderbook 是美元分（eCurrency=1），换人民币要乘汇率，
+#   但 Steam 国区定价比真实汇率低约 5%，硬乘会把全站价格带偏。
+#   这轮试：参数 / cookie / 旧接口 nameid 三条路能不能拿到 CNY 盘口。
 on:
   workflow_dispatch:
   push:
@@ -27,7 +27,7 @@ jobs:
           set -e
           mkdir -p "$OUT_DIR"
           python - <<'PY' > "$OUT_DIR/probe.txt" 2>&1
-          import gzip, http.cookiejar, json, re, time
+          import gzip, http.cookiejar as cj, json, re, time
           import urllib.error, urllib.parse, urllib.request
 
           BASE = "https://steamcommunity.com"
@@ -51,14 +51,12 @@ jobs:
 
 
           def mkop(cookies=None):
-              jar = http.cookiejar.CookieJar()
-              if cookies:
-                  import http.cookiejar as cj
-                  for k, v in cookies.items():
-                      jar.set_cookie(cj.Cookie(0, k, v, None, False,
-                                               ".steamcommunity.com", True,
-                                               False, "/", True, False, None,
-                                               False, None, None, {}))
+              jar = cj.CookieJar()
+              for k, v in (cookies or {}).items():
+                  jar.set_cookie(cj.Cookie(0, k, v, None, False,
+                                           ".steamcommunity.com", True,
+                                           False, "/", True, False, None,
+                                           False, None, None, {}))
               return urllib.request.build_opener(
                   urllib.request.HTTPCookieProcessor(jar))
 
@@ -84,8 +82,6 @@ jobs:
                   return None
               seg = un[max(0, i - 30000):i]
               di = seg.rfind('"data":{"amtMaxBuyOrder"')
-              if di < 0:
-                  di = seg.rfind('"data":{')
               if di < 0:
                   return None
               s = seg.find("{", di)
@@ -115,21 +111,8 @@ jobs:
                   return None
 
 
-          def po(op, name):
-              q = urllib.parse.urlencode({"appid": 730, "currency": 23,
-                                          "market_hash_name": name})
-              st, raw = fetch(op, BASE + "/market/priceoverview/?" + q, JSON_HDR)
-              if st != 200:
-                  return st, None
-              try:
-                  j = json.loads(raw)
-              except Exception:
-                  return st, None
-              lp = j.get("lowest_price") or ""
-              m = re.search(r"([\d.,]+)", lp)
-              return st, (float(m.group(1).replace(",", "")) if m else None)
-
-
+          ITEM = "Prisma Case"
+          QN = urllib.parse.quote(ITEM)
           print("=== 出口 IP ===")
           try:
               with urllib.request.urlopen("https://api.ipify.org", timeout=15) as r:
@@ -138,70 +121,60 @@ jobs:
               print("拿不到:", e)
           print("")
 
-          OP = mkop()
-          ITEMS = ["Prisma Case", "Fracture Case", "Kilowatt Case",
-                   "Gallery Case", "AWP | Asiimov (Field-Tested)",
-                   "AK-47 | Redline (Field-Tested)"]
-
-          print("=== A. 无 cookie：隐含汇率 ===")
-          print("  %-32s %8s %8s %10s %10s" %
-                ("物品", "eCur", "挂单分", "PO人民币", "隐含汇率"))
-          for name in ITEMS:
-              u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
-              st, raw = fetch(OP, u, HTML_HDR)
+          print("=== A. 物品页各种设法，看盘口变不变 ===")
+          print("  %-46s %4s %8s %8s" % ("设法", "eCur", "挂单分", "求购分"))
+          variants = [
+              ("plain", "", None),
+              ("?currency=23&country=CN", "?currency=23&country=CN", None),
+              ("?cc=CN", "?cc=CN", None),
+              ("cookie steamCountry=CN", "",
+               {"steamCountry": "CN"}),
+              ("cookie steamCountry=CN%7C0 + steamCurrency=CNY", "",
+               {"steamCountry": "CN%7C0", "steamCurrency": "CNY"}),
+          ]
+          for label, qs, cook in variants:
+              op = mkop(cook)
+              u = BASE + "/market/listings/730/" + QN + qs
+              st, raw = fetch(op, u, HTML_HDR)
               if st != 200:
-                  print("  %-32s 页面 HTTP %s" % (name[:32], st))
-                  time.sleep(3)
-                  continue
-              ob = parse_ob(raw.decode("utf-8", "replace"))
-              st2, lp = po(OP, name)
-              time.sleep(3)
-              if not ob:
-                  print("  %-32s 盘口解析失败" % name[:32])
-                  continue
-              sell = ob.get("amtMinSellOrder")
-              cur = ob.get("eCurrency")
-              rate = (lp / (sell / 100.0)) if (lp and sell) else None
-              print("  %-32s %8s %8s %10s %10s" %
-                    (name[:32], cur, sell, lp,
-                     ("%.2f" % rate) if rate else "-"))
-          print("  （隐含汇率 ≈7 说明是美元分；≈1 说明是人民币分）")
-          print("")
-
-          print("=== B. 带 steamCurrency cookie ===")
-          for cook in ({"steamCurrency": "CNY"},
-                       {"steamCurrency": "23"},
-                       {"steamCurrency": "cny"}):
-              OPC = mkop(cook)
-              name = "Prisma Case"
-              u = BASE + "/market/listings/730/" + urllib.parse.quote(name)
-              st, raw = fetch(OPC, u, HTML_HDR)
-              if st != 200:
-                  print("  cookie %-24s 页面 HTTP %s" % (cook, st))
+                  print("  %-46s HTTP %s" % (label, st))
                   time.sleep(3)
                   continue
               ob = parse_ob(raw.decode("utf-8", "replace"))
               if ob:
-                  print("  cookie %-24s eCurrency=%s 挂单分=%s 求购分=%s"
-                        % (cook, ob.get("eCurrency"), ob.get("amtMinSellOrder"),
-                           ob.get("amtMaxBuyOrder")))
+                  print("  %-46s %4s %8s %8s" % (label, ob.get("eCurrency"),
+                                                 ob.get("amtMinSellOrder"),
+                                                 ob.get("amtMaxBuyOrder")))
               else:
-                  print("  cookie %-24s 解析失败" % cook)
+                  print("  %-46s 解析失败" % label)
+              time.sleep(3)
+          print("  （数字有变化 = 拿到了人民币盘口；全一样 = 换不了）")
+          print("")
+
+          print("=== B. priceoverview 的 USD / CNY 两种报价 ===")
+          for cur, tag in ((1, "USD"), (23, "CNY")):
+              q = urllib.parse.urlencode({"appid": 730, "currency": cur,
+                                          "market_hash_name": ITEM})
+              st, raw = fetch(mkop(), BASE + "/market/priceoverview/?" + q, JSON_HDR)
+              print("  currency=%-3s %-3s HTTP %s  %s"
+                    % (cur, tag, st, raw.decode("utf-8", "replace")[:160]))
               time.sleep(3)
           print("")
 
-          print("=== C. 页面里的货币标记 ===")
-          u = BASE + "/market/listings/730/Prisma%20Case"
-          st, raw = fetch(OP, u, HTML_HDR)
+          print("=== C. 页面里有没有 nameid / 旧接口线索 ===")
+          st, raw = fetch(mkop(), BASE + "/market/listings/730/" + QN, HTML_HDR)
           text = raw.decode("utf-8", "replace")
-          for pat in [r'"eCurrency"\s*:\s*(\d+)', r'"strPrice"\s*:\s*"([^"]{1,20})"',
-                      r'"currency"\s*:\s*(\d+)', r'"eCurrency"\s*:\s*\{\s*"id"\s*:\s*(\d+)']:
+          for pat in (r"item_nameid", r"LoadOrderSpread", r"Market_LoadOrderSpread",
+                      r'"nameid"', r'"item_nameid"\s*:\s*"(\d+)"',
+                      r'"eCurrency"\s*:\s*(\d+)', r'"eCurrency"\s*:\s*\{[^}]{0,120}\}'):
               hits = re.findall(pat, text)
-              print("  %-44s %d 次 %s" % (pat[:44], len(hits), hits[:5]))
+              print("  %-40s %d 次 %s" % (pat[:40], len(hits), hits[:3]))
+          un = text.replace("\\\\", "\\").replace('\\"', '"')
+          i = un.find(OB_KEY)
+          if i >= 0:
+              print("  orderbook 键附近 260 字：")
+              print("  " + un[max(0, i - 130):i + 130].replace("\n", " "))
           print("")
-          # currency 对象形态
-          m = re.search(r'"eCurrency"\s*:\s*\{[^}]{0,200}\}', text)
-          print("  eCurrency 原样: %s" % (m.group(0) if m else "(不是对象)"))
           PY
           cat "$OUT_DIR/probe.txt"
 
@@ -216,5 +189,5 @@ jobs:
             "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git checkout -q -b probe-log
           git add probe.txt
-          git commit -q -m "probe r12: $(date -u +%Y-%m-%dT%H:%MZ)"
+          git commit -q -m "probe r13: $(date -u +%Y-%m-%dT%H:%MZ)"
           git push -q -f origin probe-log
