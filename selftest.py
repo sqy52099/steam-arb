@@ -136,6 +136,18 @@ def t_orderbook():
           f"得 {ob['bid_depth']}")
     check("档数与单数", ob["bid_levels"] == 2 and ob["sell_orders"] == 41827,
           f"{ob['bid_levels']}/{ob['sell_orders']}")
+    # 第三档求购价：最高价常常只挂着一件，第三档才是卖几件还吃得上的价
+    # 第三档求购价：最高价常常只挂着一件，第三档才是卖几件还吃得到的价。
+    # 默认样例的买盘只有两档（108/311、107/277），所以退到最后一档 107。
+    check("买盘不足三档时退到最后一档", ob["usd_bid3"] == 107,
+          f"得 {ob.get('usd_bid3')}")
+    three = steam.parse_orderbook(
+        _fake_page("Z", bid=150, sell=200, buys=(150, 3, 140, 5, 130, 9)), "Z")
+    check("买盘够三档时取第三档价", three["usd_bid3"] == 130,
+          f"得 {three.get('usd_bid3')}")
+    empty = steam.parse_orderbook(_fake_page("Y", buys=()), "Y")
+    check("没有买单时第三档留空，不瞎猜", empty["usd_bid3"] is None,
+          f"得 {empty.get('usd_bid3')}")
 
     # 老 bug：页面里有别的 data 对象时不能抓错
     ob2 = steam.parse_orderbook(_fake_page("Prisma Case", decoy=True), "Prisma Case")
@@ -456,6 +468,59 @@ def t_deadline():
 
 
 # ---------------- 端到端 ----------------
+
+# ---------------- 挂刀指数 ----------------
+
+def t_index():
+    print("\n挂刀指数")
+    tmp = tempfile.mkdtemp(prefix="ar bidx_".replace(" ", ""))
+    con = store.connect(os.path.join(tmp, "arb.db"))
+    try:
+        today = store.day_key(int(time.time()))
+        rows = []
+        # 三天，每天 12 件，折分别是 8.0 / 9.09 / 10.0 折
+        for back, ratio in [(2, 1.25), (1, 1.10), (0, 1.00)]:
+            for i in range(12):
+                rows.append({"hash_name": f"H{back}_{i}", "net_cny": 10.0,
+                             "sell_cny": 70.0, "bid_cny": 62.0,
+                             "src_buy": 50.0, "ratio": ratio,
+                             "_day": today - back * 86400})
+        # upsert_hist 是按天归位的，这里要指定具体哪天，所以直接写表
+        for r in rows:
+            con.execute(
+                "INSERT INTO hist(appid,hash_name,day,net_cny,sell_cny,bid_cny,"
+                "src_buy,ratio) VALUES(?,?,?,?,?,?,?,?)",
+                (730, r["hash_name"], r["_day"], r["net_cny"], r["sell_cny"],
+                 r["bid_cny"], r["src_buy"], r["ratio"]))
+        con.commit()
+        got = store.index_series(con, 30, appid=730)
+        check("按天给点", len(got["series"]) == 3, f"得 {len(got['series'])} 点")
+        # 折 = 1 / ratio：8.0 / 9.09 / 10.0，且从旧到新
+        vals = [round(p[1] * 10, 1) for p in got["series"]]
+        check("折 = 1 / ratio，从旧到新", vals == [8.0, 9.1, 10.0], f"得 {vals}")
+        check("每天的点带件数", all(p[2] == 12 for p in got["series"]),
+              f"得 {[p[2] for p in got['series']]}")
+
+        # 只有 3 件的那天不进线：件数太少的时段中位数不代表市场
+        for i in range(3):
+            con.execute(
+                "INSERT INTO hist(appid,hash_name,day,net_cny,sell_cny,bid_cny,"
+                "src_buy,ratio) VALUES(730,?,?,10,70,62,50,1.0)",
+                (f"Thin{i}", today - 3 * 86400))
+        con.commit()
+        got2 = store.index_series(con, 30, appid=730)
+        check("件数太少的那天不上线", len(got2["series"]) == 3,
+              f"得 {len(got2['series'])} 点")
+
+        # 取中位而不是平均：一件离谱的 ratio 不该把整天的折拽走
+        con.execute("UPDATE hist SET ratio=100.0 WHERE hash_name='H0_0'")
+        con.commit()
+        got3 = store.index_series(con, 30, appid=730)
+        last = round(got3["series"][2][1] * 10, 1)
+        check("用中位数，不被个别离谱值拽走", last == 10.0, f"得 {last} 折")
+    finally:
+        con.close()
+
 
 def t_fake():
     """两个阶段用同一个 shard 目录串起来跑一遍，检查导出的字段。"""
@@ -1165,6 +1230,7 @@ def main():
     t_pool_cap()
     t_shards()
     t_deadline()
+    t_index()
     t_fake()
     print("\n" + "=" * 46)
     print(f"通过 {len(OK)} 项，失败 {len(FAIL)} 项")

@@ -416,8 +416,14 @@ def parse_orderbook(html: str, hash_name: str) -> dict:
     # 买盘深度：吃掉前 10 档能接多少件。倒余额最怕「看着有价，卖不动」
     depth = sum(n for _, n in buys[:10])
 
+    # 第三档求购价。挂刀圈管这个叫「稳定求购」：最高求购价上的挂单常常
+    # 只有一件，照着它算出来的折扣是一次性的运气；第三档才是你卖几件
+    # 都还能吃到的价。买盘不足三档时退到最后那一档（有一档就用那一档）。
+    bid3 = buys[2][0] if len(buys) >= 3 else (buys[-1][0] if buys else None)
+
     return {
         "usd_bid": bid,            # 最高求购价，美元分
+        "usd_bid3": bid3,          # 第三档求购价（稳定求购），美元分
         "usd_sell": sell,          # 最低挂单价，美元分
         "buy_orders": int(ob.get("cBuyOrders") or 0),
         "sell_orders": int(ob.get("cSellOrders") or 0),

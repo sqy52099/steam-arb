@@ -27,7 +27,10 @@ KEEP_DAYS = 7
 # 版本号写进 meta，对不上就整表重建（这库本来就是可再生的缓存）。
 # v4 加了 hist：每件每天一行，给前端画涨跌用。quotes 仍然只留最新快照，
 # 因为它要一天更新几十次；hist 一天只写一次，所以攒得起。
-SCHEMA_VERSION = "4"
+# v5 加了 bid3（第三档求购价）：挂刀圈说的「稳定求购」就是按这个价卖。
+# 最高求购价常常只挂着一件，按它算出来的折扣是碰运气的；第三档才是真的
+# 能吃到几件的价。同时补 net3_cny / ratio3 两列省得前端再算一遍。
+SCHEMA_VERSION = "5"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -46,7 +49,9 @@ CREATE TABLE IF NOT EXISTS quotes (
     first_ts     INTEGER NOT NULL,   -- 第一次观测时间（看这物品跟踪了多久）
     sell_cny     REAL,               -- Steam 最低挂单价（买家付，人民币）
     bid_cny      REAL,               -- Steam 最高求购价（买家付，人民币）
+    bid3_cny     REAL,               -- 第三档求购价（「稳定求购」按这个卖）
     net_cny      REAL,               -- 按求购价秒卖，扣费后卖家净得
+    net3_cny     REAL,               -- 按第三档求购价卖，扣费后净得
     net_sell_cny REAL,               -- 按最低挂单价卖掉，扣费后卖家净得
     usd_bid      INTEGER,            -- 盘口原始值，单位美元分（留作校验）
     usd_sell     INTEGER,
@@ -59,6 +64,7 @@ CREATE TABLE IF NOT EXISTS quotes (
     src_name     TEXT,
     src_qty      INTEGER,            -- 第三方库存量
     ratio        REAL,               -- net_cny / src_buy_cny
+    ratio3       REAL,               -- net3_cny / src_buy_cny
     ratio_sell   REAL,               -- net_sell_cny / src_buy_cny
     src_mid_cny  REAL,               -- 第三方自报的 Steam 中间价（校验用）
     PRIMARY KEY (appid, hash_name)
@@ -99,21 +105,38 @@ def connect(path: str | None = None) -> sqlite3.Connection:
     return con
 
 
-def _migrate(con: sqlite3.Connection) -> None:
-    """老库直接重建 quotes —— 里面的数据本来就是每轮重新采的行情，
-    丢了下一轮就补回来，不值得写迁移脚本。
+# 后加的普通列：列名 -> 类型。缺了就用 ALTER TABLE 补，不重建表。
+# 早先是「缺列就 DROP TABLE 重建」，那时候库里的数据每轮都能重新采回来，
+# 扔掉无所谓；但从 2026-11-18 Steam 出口被封之后，库里那几十条是**封之前
+# 最后的真数据**，重建一次就再也没了。所以改成只加列。
+_ADD_COLS = {
+    "bid3_cny": "REAL",
+    "net3_cny": "REAL",
+    "ratio3": "REAL",
+}
 
-    判据是「缺列」而不是版本号：加一列就重建一次，比维护迁移链简单，
-    而且这些数据全都能重新采回来，没有任何不可再生的东西。
+
+def _migrate(con: sqlite3.Connection) -> None:
+    """老库补列；只有 v1 那种主键都不对的才整表重建。
+
+    判据是「列在不在」而不是版本号：加一列就补一次，比维护迁移链简单。
     """
-    needed = {"first_ts", "src_mid_cny"}
     exists = con.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='quotes'"
     ).fetchone()
     if exists:
-        cols = {r["name"] for r in con.execute("PRAGMA table_info(quotes)")}
-        if needed - cols:
+        info = list(con.execute("PRAGMA table_info(quotes)"))
+        cols = {r["name"] for r in info}
+        pk = [r["name"] for r in info if r["pk"]]
+        # v1 的主键是 (ts, appid, hash_name)，一件物品攒了多行，latest_quotes
+        # 会读到重复行 —— 这种只能重建。
+        if pk != ["appid", "hash_name"]:
             con.execute("DROP TABLE quotes")
+            con.commit()
+        else:
+            for name, typ in _ADD_COLS.items():
+                if name not in cols:
+                    con.execute(f"ALTER TABLE quotes ADD COLUMN {name} {typ}")
             con.commit()
     con.executescript(SCHEMA)
     con.execute(
@@ -155,10 +178,11 @@ def upsert_items(con, rows: list[dict], appid: int = 730) -> int:
 # ---------------- quotes ----------------
 
 QUOTE_COLS = (
-    "ts", "first_ts", "sell_cny", "bid_cny", "net_cny", "net_sell_cny",
+    "ts", "first_ts", "sell_cny", "bid_cny", "bid3_cny",
+    "net_cny", "net3_cny", "net_sell_cny",
     "usd_bid", "usd_sell", "fx", "bid_depth", "bid_levels",
     "sell_orders", "buy_orders", "src_buy_cny", "src_name", "src_qty",
-    "ratio", "ratio_sell", "src_mid_cny",
+    "ratio", "ratio3", "ratio_sell", "src_mid_cny",
 )
 
 
@@ -294,6 +318,38 @@ def purge_hist(con, keep_days: int = HIST_DAYS) -> int:
     n = con.execute("DELETE FROM hist WHERE day < ?", (cutoff,)).rowcount
     con.commit()
     return n
+
+
+def index_series(con, days: int = HIST_DAYS, appid: int = 730,
+                 limit: int = 5000) -> dict:
+    """挂刀指数：每天全站中位折扣。参考站首页左上角那个数就是它。
+
+    折扣 = 买入价 ÷ 净得余额（0.79 = 7.9 折，越低越划算）。逐件取
+    ratio 再折成 1/ratio，然后对当天所有物品取中位数 —— 取中位而不是
+    平均，是因为一件挂单只剩一件的离谱高价能把平均值拽上天。
+
+    hist 里存的是 ratio（net/src_buy），所以 disc = 1/ratio。
+    只返回至少一个点的日子；点太少的日子（少于 limit//20 件）不算，
+    免得某个冷清时段把整条线带偏。
+    """
+    since = day_key() - (days - 1) * 86400
+    cur = con.execute(
+        """SELECT day, ratio FROM hist
+           WHERE appid=? AND day>=? AND ratio IS NOT NULL AND ratio>0
+           ORDER BY day""",
+        (appid, since))
+    byday: dict[int, list[float]] = {}
+    for r in cur.fetchall():
+        byday.setdefault(r["day"], []).append(1.0 / r["ratio"])
+    floor = 10   # 至少 10 件才算「这一天有代表性」，太少的时段别把线扯歪
+    series = []
+    for day in sorted(byday):
+        vals = sorted(byday[day])
+        if len(vals) < floor:
+            continue
+        series.append([day, round(vals[len(vals) // 2], 4), len(vals)])
+    return {"days": days, "series": series,
+            "floor": floor}
 
 
 def stats(con) -> dict:

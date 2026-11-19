@@ -33,9 +33,9 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import fees
 import thirdparty
-from store import (connect, day_key, hist_series, latest_quotes, meta_get,
-                   meta_set, purge_hist, purge_old, stats, upsert_hist,
-                   upsert_items, upsert_quotes, HIST_DAYS)
+from store import (connect, day_key, hist_series, index_series, latest_quotes,
+                   meta_get, meta_set, purge_hist, purge_old, stats,
+                   upsert_hist, upsert_items, upsert_quotes, HIST_DAYS)
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # ARB_DATA 让 CI 把产物直接写进 data 分支的克隆目录
@@ -167,6 +167,7 @@ def build_est_rows(cand: dict[str, dict], real_names: set[str],
             "n": name,
             "sell": round(mid, 2),
             "bid": None,
+            "bid3": None,
             "net": round(net, 2),
             "net_sell": round(net, 2),
             "buy": round(buy, 2),
@@ -176,6 +177,7 @@ def build_est_rows(cand: dict[str, dict], real_names: set[str],
             "orders": None,
             "sell_orders": None,
             "ratio": round(ratio, 4),
+            "ratio3": None,
             "ratio_sell": None,
             "ts": now,
             "est": 1,
@@ -301,6 +303,7 @@ def run_collect(args) -> None:
         items.append({
             "n": hn,
             "usd_bid": ob["usd_bid"], "usd_sell": ob["usd_sell"],
+            "usd_bid3": ob.get("usd_bid3"),
             "buy": c["buy_cny"], "src": c["src"], "qty": c.get("src_qty") or 0,
             # 第三方自报的 Steam 中间价（人民币）。合并阶段用它做合理性校验：
             # 物品页的最低挂单价在「挂单只剩一两件」时会离谱得离谱，得有个
@@ -531,17 +534,24 @@ def run_merge(args) -> None:
         buy = it.get("buy")
         net = fees.net_from_buyer(bid_cny)              # 挂求购价，立刻成交
         net_sell = fees.net_from_buyer(sell_cny) if sell_cny else None
+        # 第三档求购价：买盘不足三档时 collect 那边会退到最后一档，也可能是
+        # 没抓到 —— 那就留空，前端这一口径的折显示「—」，不要拿最高价顶，
+        # 那等于把「一件的运气」当成「几件的价」。
+        b3 = it.get("usd_bid3")
+        bid3_cny = round(b3 / 100.0 * fx, 2) if b3 else None
+        net3 = fees.net_from_buyer(bid3_cny) if bid3_cny else None
         rows.append({
             "hash_name": it["n"], "ts": it.get("ts") or now,
             "first_ts": now,
-            "sell_cny": sell_cny, "bid_cny": bid_cny,
-            "net_cny": net, "net_sell_cny": net_sell,
+            "sell_cny": sell_cny, "bid_cny": bid_cny, "bid3_cny": bid3_cny,
+            "net_cny": net, "net3_cny": net3, "net_sell_cny": net_sell,
             "usd_bid": ub, "usd_sell": us, "fx": fx,
             "bid_depth": it.get("depth"), "bid_levels": it.get("blevels"),
             "sell_orders": it.get("sells"), "buy_orders": it.get("buys"),
             "src_buy_cny": buy, "src_name": it.get("src"),
             "src_qty": it.get("qty"),
             "ratio": round(net / buy, 4) if buy else None,
+            "ratio3": round(net3 / buy, 4) if (buy and net3) else None,
             "ratio_sell": round(net_sell / buy, 4)
                           if (buy and net_sell) else None,
             "src_mid_cny": it.get("mid"),      # 导出时还要用它复筛一遍
@@ -628,6 +638,27 @@ def export(args, con, est_rows: list[dict] | None = None) -> None:
         fx = float(meta_get(con, "fx"))
     except Exception:
         pass
+
+    # 挂刀指数：每天全站中位折扣。参考站首页左上角那个数就是它，
+    # 但我们不用另外采 —— hist 表里每件每天的 ratio 已经攒着了。
+    try:
+        idx = index_series(con, HIST_DAYS, appid=APPID)
+    except Exception as e:
+        log(f"挂刀指数算不出来：{e}")
+        idx = {"days": HIST_DAYS, "series": [], "floor": 0}
+    # 今天的点用当前这批行情补一个（hist 要等 merge 写完才有当天行，
+    # 而导出的这一刻手上就有全部行，直接算更准）。
+    today = day_key()
+    cur_disc = sorted((r["src_buy_cny"] / r["net_cny"]
+                       for r in rows
+                       if r.get("net_cny") and r.get("src_buy_cny")))
+    if cur_disc:
+        mid = cur_disc[len(cur_disc) // 2]
+        idx["series"] = [p for p in idx["series"] if p[0] != today]
+        idx["series"].append([today, round(mid, 4), len(cur_disc)])
+        idx["series"].sort()
+    idx["now"] = round(cur_disc[len(cur_disc) // 2], 4) if cur_disc else None
+
     out = {
         "generated": int(time.time()),
         "rate_usd_cny": usd_cny(),
@@ -639,14 +670,18 @@ def export(args, con, est_rows: list[dict] | None = None) -> None:
         "count": len(rows) + len(est_rows or []),
         "real": len(rows),
         "est": len(est_rows or []),
-        "note": ("ratio = 按 Steam 求购价卖出的净得 ÷ 第三方买入价，1 以上才不亏面值；"
-                 "余额折现还要再乘 0.75~0.85。bid/sell 都由盘口美元分按国区折算比换成人民币。"),
+        "index": idx,
+        "note": ("折 = 买入价 ÷ 卖掉的净得余额，7.9 折就是花 79 元拿到 100 元余额，越低越划算；"
+                 "「稳定求购」按第三档求购价算，「寄售」按最低挂单价算（要等有人买）。"
+                 "余额不能提现，折成现金还要再乘 0.75~0.85。"),
         "health": _HEALTH,
         "items": [{
             "n": r["hash_name"],
             "sell": r["sell_cny"],
             "bid": r["bid_cny"],
+            "bid3": r["bid3_cny"],
             "net": r["net_cny"],
+            "net3": r["net3_cny"],
             "net_sell": r["net_sell_cny"],
             "buy": r["src_buy_cny"],
             "src": r["src_name"],
@@ -655,6 +690,7 @@ def export(args, con, est_rows: list[dict] | None = None) -> None:
             "orders": r["buy_orders"],
             "sell_orders": r["sell_orders"],
             "ratio": r["ratio"],
+            "ratio3": r["ratio3"],
             "ratio_sell": r["ratio_sell"],
             "ts": r["ts"],
             "est": 0,
@@ -700,9 +736,11 @@ def run_fake(args) -> None:
             buy = round(rnd.uniform(3, 400), 2)
             usd_sell = int(round(buy * rnd.uniform(1.0, 1.45) / 6.8 * 100))
             usd_bid = int(round(usd_sell * rnd.uniform(0.75, 0.98)))
+            usd_bid3 = int(round(usd_bid * rnd.uniform(0.90, 0.995)))
             items.append({
                 "n": f"Fake Item {k:03d}",
                 "usd_bid": usd_bid, "usd_sell": usd_sell,
+                "usd_bid3": usd_bid3,
                 "buy": buy, "src": "fake", "qty": rnd.randint(1, 50),
                 "depth": rnd.randint(0, 60), "blevels": rnd.randint(1, 20),
                 "buys": rnd.randint(1, 900), "sells": rnd.randint(1, 900),
@@ -735,18 +773,22 @@ def merge_fake(args) -> None:
     for it in items:
         bid_cny = round(it["usd_bid"] / 100.0 * fx, 2)
         sell_cny = round(it["usd_sell"] / 100.0 * fx, 2)
+        b3 = it.get("usd_bid3")
+        bid3_cny = round(b3 / 100.0 * fx, 2) if b3 else None
         net = fees.net_from_buyer(bid_cny)
         net_sell = fees.net_from_buyer(sell_cny)
+        net3 = fees.net_from_buyer(bid3_cny) if bid3_cny else None
         rows.append({
             "hash_name": it["n"], "ts": it["ts"], "first_ts": now,
-            "sell_cny": sell_cny, "bid_cny": bid_cny,
-            "net_cny": net, "net_sell_cny": net_sell,
+            "sell_cny": sell_cny, "bid_cny": bid_cny, "bid3_cny": bid3_cny,
+            "net_cny": net, "net3_cny": net3, "net_sell_cny": net_sell,
             "usd_bid": it["usd_bid"], "usd_sell": it["usd_sell"], "fx": fx,
             "bid_depth": it["depth"], "bid_levels": it["blevels"],
             "sell_orders": it["sells"], "buy_orders": it["buys"],
             "src_buy_cny": it["buy"], "src_name": it["src"],
             "src_qty": it["qty"],
             "ratio": round(net / it["buy"], 4),
+            "ratio3": round(net3 / it["buy"], 4) if net3 else None,
             "ratio_sell": round(net_sell / it["buy"], 4),
         })
     upsert_quotes(con, rows)
@@ -803,11 +845,13 @@ def main() -> None:
     ap.add_argument("--in-dir", default="")
     ap.add_argument("--fx-samples", type=int, default=6,
                     help="标定折算比用几个样本（每个 2 次请求）")
-    ap.add_argument("--export-limit", type=int, default=800)
+    ap.add_argument("--export-limit", type=int, default=1500,
+                    help="实测行最多导出多少条（估算行另有 --est-cap）")
     ap.add_argument("--within-hours", type=int, default=48)
-    ap.add_argument("--est-cap", type=int, default=800,
+    ap.add_argument("--est-cap", type=int, default=1500,
                     help="Steam 拿不到真实盘口时，用第三方中间价估多少件"
-                         "（0 = 关掉估算，只导出实测过的）")
+                         "（0 = 关掉估算，只导出实测过的）。默认 1500 "
+                         "件 ≈ 380KB，足够把候选池铺满又不至于首屏太慢")
     ap.add_argument("--deadline", type=float, default=0,
                     help="本轮最多干多少分钟，到点自己收工")
     a = ap.parse_args()

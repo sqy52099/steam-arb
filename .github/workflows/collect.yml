@@ -174,7 +174,7 @@ jobs:
           ls -la /tmp/shards || true
           # 折算比标定要问 Steam 的 priceoverview（每样本 2 次请求），
           # 6 个样本 = 12 次，几十秒。
-          python run.py --mode merge --in-dir /tmp/shards --fx-samples 6 --est-cap 800
+          python run.py --mode merge --in-dir /tmp/shards --fx-samples 6 --est-cap 1500
           code=$?
           echo "合并 exit=$code"
           # 退出码留在文件里给汇总那步看。不 exit 1 是为了让后面的
