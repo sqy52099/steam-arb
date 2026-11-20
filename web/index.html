@@ -1631,9 +1631,15 @@ function renderCalc(){
   // 其实是「一年一直这么亏才会亏光」。这种夸张不如不给，回报率那格已经说清了。
   const ann = (spent > 0 && pnl >= 0 && days > 0)
     ? Math.pow(1 + pnl / spent, 365 / days) - 1 : null;
+  // 上限 1000%：复利口径诚实，但一年真能转 50 圈本来就不现实。
+  // 线上见过 +17635%，那个数字除了让人上头没有别的用途。
   const annCell = cell(`年化（${fmt(days, 0)} 天一轮）`,
-       n2(ann == null ? '—' : '+' + fmt(ann * 100, 0) + '%'),
+       n2(ann == null ? '—' : (ann > 10 ? '>1000%' : '+' + fmt(ann * 100, 0) + '%')),
        ann == null ? null : 'good');
+  if(ann != null && ann > 10)
+    annCell.querySelector('b').title =
+      `按复利算是 ${fmt(ann * 100, 0)}%，但一年真转 ${fmt(365 / days, 0)} 圈不现实`
+      + '（买不到那么多、也卖不掉那么快），所以显示上限 1000%';
   if(ann == null && rows.length && pnl < 0)
     annCell.querySelector('b').title = '这一轮是亏的，不折算年化 —— 折算出来会变成 -100%，那是夸张不是信息';
   if(want > 0) cell('离目标还差', n2('¥' + fmt(Math.max(0, want - face))));

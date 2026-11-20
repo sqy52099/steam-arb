@@ -38,13 +38,15 @@ on:
   # 才知道恢复没有。但每 push 就是一轮采集请求，所以把 push 这一路的批量
   # 压到 40 件（见下面 BATCH）—— 一趟 4x40 = 160 次物品页请求，够看出通不通，
   # 不至于像之前那样每次 push 就砸 480 次把封禁续上。
+  #
+  # 只跟采集相关的改动才触发。改前端（web/**、build_site.py）走 deploy.yml：
+  # 那条只把 data 分支现有的数据重新发一遍、完全不碰 Steam。以前这里也列了
+  # web/**，结果改一行 CSS 就顺带砸一轮采集，纯属浪费出口额度。
   # schedule 仍然关着：定时才是「一直续期」的元凶，等确认通了再开。
   push:
     branches: [main]
     paths:
       - "collector/**"
-      - "web/**"
-      - "build_site.py"
       - ".github/workflows/collect.yml"
 
 permissions:
