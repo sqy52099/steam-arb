@@ -246,6 +246,7 @@ tr.calcrow:hover td{background:var(--panel)}
     <circle class="pt" id="idxDot" r="2.4" cx="-9" cy="-9"></circle>
   </svg>
   <span class="tip" id="idxTip">全站中位 · 越低越划算</span>
+  <span class="tip" id="gunNote" style="display:none"></span>
   <div class="guns" id="guns" title="按哪个价卖 —— 同一件物品换个卖法，折数完全不同">
     <button class="gun on" data-gun="bid">求购价卖</button>
     <button class="gun" data-gun="bid3">稳定求购</button>
@@ -897,6 +898,17 @@ function render(){
   $('favOnly').classList.toggle('on', FAVONLY);
   $('realOnly').classList.toggle('on', REALONLY);
   $('fDiscLabel').textContent = `折现系数（临界 ${fmt((1/d)*10, 1)} 折）`;
+  // 切到某个卖法，而这批数据里那个价大面积为空 —— 说一句，别让人对着一屏「—」发呆。
+  // 上线第一天就是这样：稳定求购价要等新一轮采集才有，旧数据里没有。
+  const real = RAW.filter(it => !it.est);
+  const lack = real.filter(it => ratioOf(it) == null).length;
+  const gn = $('gunNote');
+  if(GUN !== 'bid' && real.length && lack >= real.length / 2){
+    gn.textContent = `这批数据还没采到「${GUNS[GUN].label}」的价（${lack}/${real.length} 件没有），等下一轮采集通了才有`;
+    gn.style.display = '';
+  }else{
+    gn.style.display = 'none';
+  }
   // 表头那列写清现在是按哪种卖法算的折，不然「折」是哪一个价都说不清
   if($('thGun')) $('thGun').textContent = GUNS[GUN].label;
 
