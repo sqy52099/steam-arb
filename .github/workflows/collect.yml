@@ -34,16 +34,18 @@ on:
         description: "每个 shard 采几件（探情况时用小的，20 件约 2 分钟）"
         required: false
         default: "120"
-  # push 触发也一起停了。原来「改了采集代码就等于顺手验一次」是对的，
-  # 但前提是出口能用；现在每 push 一次就是 4x120 次 429，只会让封禁
-  # 续期。等出口换好再把这四行 paths 放回来。
-  # push:
-  #   branches: [main]
-  #   paths:
-  #     - "collector/**"
-  #     - "web/**"
-  #     - "build_site.py"
-  #     - ".github/workflows/collect.yml"
+  # 2026-11-20 把 push 放回来：出口封了整整一天，中间一直没跑，需要真跑一轮
+  # 才知道恢复没有。但每 push 就是一轮采集请求，所以把 push 这一路的批量
+  # 压到 40 件（见下面 BATCH）—— 一趟 4x40 = 160 次物品页请求，够看出通不通，
+  # 不至于像之前那样每次 push 就砸 480 次把封禁续上。
+  # schedule 仍然关着：定时才是「一直续期」的元凶，等确认通了再开。
+  push:
+    branches: [main]
+    paths:
+      - "collector/**"
+      - "web/**"
+      - "build_site.py"
+      - ".github/workflows/collect.yml"
 
 permissions:
   contents: write
@@ -87,8 +89,9 @@ jobs:
           # 同期单发探针在同一出口能拿 200 —— 限流是窗口式的，撞窗口靠多试。
           STEAM_BACKOFF_CAP: "6"
           SHARD_ID: ${{ matrix.shard }}
-          # 手动触发时用输入值；定时/push 用默认 120 件、12 分钟。
-          BATCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.batch || '120' }}
+          # 手动触发用输入值；push / 定时用 40 件 —— 每 push 一轮都会打到
+          # Steam，探情况别砸太狠（4x40 = 160 次物品页请求，约 5 分钟）
+          BATCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.batch || '40' }}
           OUT_DIR: /tmp/shards
         run: |
           set +e
