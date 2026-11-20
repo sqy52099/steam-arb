@@ -247,8 +247,9 @@ jobs:
                    time.strftime("%Y-%m-%d %H:%M", time.localtime(d["generated"])),
                    age))
           if d.get("est"):
+              # 这里的 %% 是转义：整行还要过一次 % 格式化，写一个 % 会当成格式符
               print("- 估算的那 %d 件没有真实盘口，是用第三方中间价折出来的，"
-                    "通常比能卖到的价高 10~20%，别当成真机会。" % d["est"])
+                    "通常比能卖到的价高 10~20%%，别当成真机会。" % d["est"])
           if dead:
               msg = ("%s 失败 —— 多半是 runner 出口被 Steam 拦了，本轮页面数字不变"
                      % "、".join(dead))
@@ -272,7 +273,17 @@ jobs:
               print("**❌ 合并入库那步崩了（exit %d）—— 上面的数字可能是旧的，"
                     "去 log 里看 traceback**" % mcode)
               print("::error::合并入库崩溃 exit %d" % mcode)
-          top = sorted(d["items"], key=lambda x: -(x.get("ratio") or 0))[:8]
+          # 前 8 名只从实测行里挑。估算行排在上面会让人以为「这就是今天最好的机会」，
+          # 而它的价是按中间价折的、偏乐观 10~20%。一件实测都没有时才拿估算顶上。
+          est_items = [it for it in d["items"] if it.get("est")]
+          real_items = [it for it in d["items"] if not it.get("est")]
+          top = sorted(real_items, key=lambda x: -(x.get("ratio") or 0))[:8]
+          if not top:
+              top = sorted(est_items, key=lambda x: -(x.get("ratio") or 0))[:8]
+              if top:
+                  print("")
+                  print("**下面这 8 行全是估算的 —— 这轮一件实测都没有，"
+                        "它们的价按中间价折出来，通常比能卖到的价高 10~20%。**")
           if top:
               print("")
               print("| 面值比 | 物品 | 买入 | 净得 | 买盘深度 |")

@@ -52,6 +52,12 @@ MAX_DEV = 0.40      # 与第三方自报中间价偏离超过 40% 就判为不�
 # 预估面值比低于这个数就不值得花一次请求去核实。一次请求 2.5 秒，
 # 而候选有六千多件，全查一遍要四个多小时 —— 只能先粗排再细查。
 MIN_EST = 0.95
+# 估出来的面值比还有个上限。线上第一轮就露了馅：估算排出来一件
+# 「★ Huntsman Knife | Scorched (Factory New)」买入 ¥1779、中间价折出 ¥6242，
+# 面值比 3.5（3.5 折）。真实行情里 7 折已经少见，3.5 折只可能是第三方把
+# 不同磨损/版本的价混在一起。一条这样的假机会比空着坏得多，所以封顶：
+# 中间价比买入价高 60% 以上的一律不当成机会。
+MAX_EST = 1.6
 
 # 本轮采集的硬截止时间点（monotonic）。CI 上超时会被硬杀，那时一步都没
 # 提交，整轮白跑；所以宁可少采一点也要自己先收工，把拿到的写出去。
@@ -161,7 +167,7 @@ def build_est_rows(cand: dict[str, dict], real_names: set[str],
             continue
         net = fees.net_from_buyer(mid)
         ratio = net / buy
-        if ratio < MIN_EST:
+        if ratio < MIN_EST or ratio > MAX_EST:
             continue
         rows.append({
             "n": name,

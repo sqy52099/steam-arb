@@ -1170,14 +1170,18 @@ def t_est():
                           "detail": [], "src": "shard"},
                    "items": real}, f, ensure_ascii=False)
 
-    # 中间价 ¥20、买入 ¥10：净得 net_from_buyer(20)=17.40，ratio 1.74
+    # 中间价 ¥14、买入 ¥10：净得 net_from_buyer(14)=12.00，ratio 1.20
     # 中间价 ¥5、买入 ¥30：ratio 0.14 < MIN_EST，必须被丢掉
+    # 中间价 ¥100、买入 ¥10：ratio 8.5 > MAX_EST —— 线上真出现过这种（刀具
+    #   买入 ¥1779、中间价折出 ¥6242、面值比 3.5），一条假机会比空着坏得多
     # 「Real Thing」已经在实测里，不能再出现一遍
     cand = {
-        "Est Good": {"buy_cny": 10.0, "steam_mid_cny": 20.0,
+        "Est Good": {"buy_cny": 10.0, "steam_mid_cny": 14.0,
                      "src": "skinport", "src_qty": 25},
         "Est Junk": {"buy_cny": 30.0, "steam_mid_cny": 5.0,
                      "src": "skinport", "src_qty": 8},
+        "Est Too Good": {"buy_cny": 10.0, "steam_mid_cny": 100.0,
+                         "src": "skinport", "src_qty": 4},
         "Est No Mid": {"buy_cny": 12.0, "steam_mid_cny": 0,
                        "src": "waxpeer", "src_qty": 5},
         "Real Thing": {"buy_cny": 1.0, "steam_mid_cny": 999.0,
@@ -1218,13 +1222,17 @@ def t_est():
               e.get("bid") is None and e.get("depth") is None
               and e.get("sell_orders") is None,
               str((e.get("bid"), e.get("depth"), e.get("sell_orders"))))
+        exp = fees.net_from_buyer(14.0) / 10.0
         check("估算的面值比 = 中间价净得 ÷ 买入价",
               e.get("n") == "Est Good"
-              and abs((e.get("ratio") or 0) - 1.74) < 0.01, str(e.get("ratio")))
+              and abs((e.get("ratio") or 0) - exp) < 0.01,
+              "%s vs %s" % (e.get("ratio"), round(exp, 4)))
         check("估算行拿中间价当卖价",
-              abs((e.get("sell") or 0) - 20.0) < 0.01, str(e.get("sell")))
+              abs((e.get("sell") or 0) - 14.0) < 0.01, str(e.get("sell")))
         check("比 MIN_EST 还差的估算直接丢",
               all(it.get("n") != "Est Junk" for it in items))
+        check("比 MAX_EST 还好的估算也丢（线上那件 3.5 折的假机会）",
+              all(it.get("n") != "Est Too Good" for it in items))
         check("没有中间价的估算丢掉",
               all(it.get("n") != "Est No Mid" for it in items))
         check("同一件不会既实测又估算",
@@ -1235,7 +1243,7 @@ def t_est():
               str((d.get("health") or {}).get("est")))
 
         # est_cap 是真的截断，不是只写在帮助文本里
-        cand2 = {"Cap %02d" % i: {"buy_cny": 10.0, "steam_mid_cny": 20.0,
+        cand2 = {"Cap %02d" % i: {"buy_cny": 10.0, "steam_mid_cny": 14.0,
                                   "src": "skinport", "src_qty": 1}
                  for i in range(30)}
         run.fetch_candidates = lambda prefix="": cand2
