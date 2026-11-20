@@ -173,6 +173,9 @@ def build_est_rows(cand: dict[str, dict], real_names: set[str],
             "buy": round(buy, 2),
             "src": c.get("src"),
             "qty": c.get("src_qty") or 0,
+            "vol": None,
+            "bsp": c.get("buy_skinport"), "bwp": c.get("buy_waxpeer"),
+            "qsp": c.get("qty_skinport"), "qwp": c.get("qty_waxpeer"),
             "depth": None,
             "orders": None,
             "sell_orders": None,
@@ -305,6 +308,9 @@ def run_collect(args) -> None:
             "usd_bid": ob["usd_bid"], "usd_sell": ob["usd_sell"],
             "usd_bid3": ob.get("usd_bid3"),
             "buy": c["buy_cny"], "src": c["src"], "qty": c.get("src_qty") or 0,
+            # 平台分价：没有报价的写 None（前端显示「—」），别写成 0
+            "bsp": c.get("buy_skinport"), "bwp": c.get("buy_waxpeer"),
+            "qsp": c.get("qty_skinport"), "qwp": c.get("qty_waxpeer"),
             # 第三方自报的 Steam 中间价（人民币）。合并阶段用它做合理性校验：
             # 物品页的最低挂单价在「挂单只剩一两件」时会离谱得离谱，得有个
             # 独立来源对一下才知道那个盘口能不能信。
@@ -337,7 +343,20 @@ def run_collect(args) -> None:
         try:
             fx_info = st.market_factor(fx_marks, max_seconds=60)
         except Exception as e:
+            fx_info = {"factor": None, "n": 0}
             log(f"  折算比标定抛异常：{e}")
+
+    # 标定那几件顺便会把 24 小时成交量带回来（同一个接口的 volume 字段，
+    # 不另发请求）。挂到对应的件上：多一件真成交量，就少一处「—」。
+    vols = (fx_info or {}).get("vols") or {}
+    if vols:
+        hit = 0
+        for it in items:
+            v = vols.get(it["n"])
+            if v:
+                it["vol"] = v
+                hit += 1
+        log(f"  顺带拿到 {hit} 件的 24 小时成交量")
     _write_shard(args, items, "", fx_info)
 
 
@@ -550,6 +569,10 @@ def run_merge(args) -> None:
             "sell_orders": it.get("sells"), "buy_orders": it.get("buys"),
             "src_buy_cny": buy, "src_name": it.get("src"),
             "src_qty": it.get("qty"),
+            # 两家平台各自报的价，给前端「多平台同屏」用
+            "vol": it.get("vol"),
+            "buy_sp": it.get("bsp"), "buy_wp": it.get("bwp"),
+            "qty_sp": it.get("qsp"), "qty_wp": it.get("qwp"),
             "ratio": round(net / buy, 4) if buy else None,
             "ratio3": round(net3 / buy, 4) if (buy and net3) else None,
             "ratio_sell": round(net_sell / buy, 4)
@@ -686,6 +709,9 @@ def export(args, con, est_rows: list[dict] | None = None) -> None:
             "buy": r["src_buy_cny"],
             "src": r["src_name"],
             "qty": r["src_qty"],
+            "vol": r["vol"],
+            "bsp": r["buy_sp"], "bwp": r["buy_wp"],
+            "qsp": r["qty_sp"], "qwp": r["qty_wp"],
             "depth": r["bid_depth"],
             "orders": r["buy_orders"],
             "sell_orders": r["sell_orders"],
@@ -742,6 +768,11 @@ def run_fake(args) -> None:
                 "usd_bid": usd_bid, "usd_sell": usd_sell,
                 "usd_bid3": usd_bid3,
                 "buy": buy, "src": "fake", "qty": rnd.randint(1, 50),
+                # 平台分价：让两家都报，其中一家正好是买入价
+                "bsp": buy if rnd.random() < 0.6 else round(buy * rnd.uniform(1.01, 1.2), 2),
+                "bwp": buy if rnd.random() < 0.6 else round(buy * rnd.uniform(1.01, 1.2), 2),
+                "qsp": rnd.randint(0, 40), "qwp": rnd.randint(0, 40),
+                "vol": rnd.choice([0, None, rnd.randint(1, 2000)]),
                 "depth": rnd.randint(0, 60), "blevels": rnd.randint(1, 20),
                 "buys": rnd.randint(1, 900), "sells": rnd.randint(1, 900),
                 "ts": int(time.time()),
@@ -787,6 +818,9 @@ def merge_fake(args) -> None:
             "sell_orders": it["sells"], "buy_orders": it["buys"],
             "src_buy_cny": it["buy"], "src_name": it["src"],
             "src_qty": it["qty"],
+            "vol": it.get("vol"),
+            "buy_sp": it.get("bsp"), "buy_wp": it.get("bwp"),
+            "qty_sp": it.get("qsp"), "qty_wp": it.get("qwp"),
             "ratio": round(net / it["buy"], 4),
             "ratio3": round(net3 / it["buy"], 4) if net3 else None,
             "ratio_sell": round(net_sell / it["buy"], 4),

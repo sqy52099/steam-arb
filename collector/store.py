@@ -27,10 +27,12 @@ KEEP_DAYS = 7
 # 版本号写进 meta，对不上就整表重建（这库本来就是可再生的缓存）。
 # v4 加了 hist：每件每天一行，给前端画涨跌用。quotes 仍然只留最新快照，
 # 因为它要一天更新几十次；hist 一天只写一次，所以攒得起。
+# v6 加了两家平台的原始报价（buy_sp / buy_wp）：页面要把「这件在 Skinport
+# 卖多少、在 Waxpeer 卖多少」并排显示，只存「更便宜的那个」就说不清差价。
 # v5 加了 bid3（第三档求购价）：挂刀圈说的「稳定求购」就是按这个价卖。
 # 最高求购价常常只挂着一件，按它算出来的折扣是碰运气的；第三档才是真的
 # 能吃到几件的价。同时补 net3_cny / ratio3 两列省得前端再算一遍。
-SCHEMA_VERSION = "5"
+SCHEMA_VERSION = "6"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS items (
@@ -62,7 +64,12 @@ CREATE TABLE IF NOT EXISTS quotes (
     buy_orders   INTEGER,            -- 求购单件数
     src_buy_cny  REAL,               -- 第三方买入价
     src_name     TEXT,
-    src_qty      INTEGER,            -- 第三方库存量
+    src_qty      INTEGER,            -- 第三方库存量（更便宜那家的）
+    vol          INTEGER,            -- Steam 24 小时成交量（拿不到就是 NULL，别当 0）
+    buy_sp       REAL,               -- Skinport 报价（没货就是 NULL）
+    buy_wp       REAL,               -- Waxpeer 报价
+    qty_sp       INTEGER,
+    qty_wp       INTEGER,
     ratio        REAL,               -- net_cny / src_buy_cny
     ratio3       REAL,               -- net3_cny / src_buy_cny
     ratio_sell   REAL,               -- net_sell_cny / src_buy_cny
@@ -113,6 +120,11 @@ _ADD_COLS = {
     "bid3_cny": "REAL",
     "net3_cny": "REAL",
     "ratio3": "REAL",
+    "vol": "INTEGER",
+    "buy_sp": "REAL",
+    "buy_wp": "REAL",
+    "qty_sp": "INTEGER",
+    "qty_wp": "INTEGER",
 }
 
 
@@ -182,6 +194,7 @@ QUOTE_COLS = (
     "net_cny", "net3_cny", "net_sell_cny",
     "usd_bid", "usd_sell", "fx", "bid_depth", "bid_levels",
     "sell_orders", "buy_orders", "src_buy_cny", "src_name", "src_qty",
+    "vol", "buy_sp", "buy_wp", "qty_sp", "qty_wp",
     "ratio", "ratio3", "ratio_sell", "src_mid_cny",
 )
 

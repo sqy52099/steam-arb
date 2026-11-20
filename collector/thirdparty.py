@@ -128,7 +128,12 @@ def fetch_waxpeer(usd_cny: float, timeout: int = 180) -> dict[str, dict]:
 
 def merge(wax: dict, skin: dict) -> list[dict]:
     """以 Waxpeer 为主表（它有 type/rarity，便于筛选），补上 Skinport 的价，
-    取两家里面更便宜的作为「买入价」。"""
+    取两家里面更便宜的作为「买入价」。
+
+    两家各自的价格也一并留下（buy_skinport / buy_waxpeer）—— 页面要把
+    「同一件东西在几个平台各卖多少钱」并排显示。只留最低价的话，前端
+    只能说「某处更便宜」，说不出便宜多少、也看不出另一家有没有货。
+    """
     rows = []
     now = int(time.time())
     for name, w in wax.items():
@@ -149,6 +154,11 @@ def merge(wax: dict, skin: dict) -> list[dict]:
             "buy_cny": buy,
             "src": src,
             "src_qty": (s.get("qty") if src == "skinport" else w["qty"]) or 0,
+            # 各平台原始报价。没有货写 None 不要写 0 —— 0 会被当成免费
+            "buy_skinport": round(sb, 2) if sb > 0 else None,
+            "buy_waxpeer": round(wb, 2),
+            "qty_skinport": int(s.get("qty") or 0) if sb > 0 else None,
+            "qty_waxpeer": int(w["qty"] or 0),
             "steam_mid_cny": w["steam_mid_cny"],
             "type": w["type"],
             "rarity": w["rarity"],

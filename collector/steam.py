@@ -304,6 +304,10 @@ def market_factor(items: list[str], min_usd: float = 0.5,
     t0 = time.monotonic()
     pairs = []
     detail = []
+    # 顺手把 24 小时成交量带回来：这两个价格接口本来就会返 volume 字段，
+    # 不另发请求。覆盖的只是拿来标定的那几件，但聊胜于无 —— 而且是真值，
+    # 比拿别的字段冒充强。
+    vols: dict[str, int] = {}
     misses = 0
     for hn in items:
         if time.monotonic() - t0 > max_seconds:
@@ -329,10 +333,14 @@ def market_factor(items: list[str], min_usd: float = 0.5,
         if not u or not c or u < min_usd:
             continue
         pairs.append(c / u)
+        v = usd.get("volume")
+        if v:
+            vols[hn] = int(v)
         detail.append({"n": hn, "usd": u, "cny": c, "f": round(c / u, 3)})
 
     if not pairs:
-        return {"factor": None, "n": 0, "spread": None, "detail": detail}
+        return {"factor": None, "n": 0, "spread": None, "detail": detail,
+                "vols": vols}
 
     pairs.sort()
     mid = pairs[len(pairs) // 2]
@@ -344,6 +352,7 @@ def market_factor(items: list[str], min_usd: float = 0.5,
         "n": len(pairs),
         "spread": round((hi - lo) / mid, 4) if mid else None,
         "detail": detail,
+        "vols": vols,
     }
 
 

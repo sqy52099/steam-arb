@@ -596,7 +596,8 @@ def t_merge_real():
          "blevels": 3, "buys": 100, "sells": 20, "ts": now},
         {"n": "Pricey Thing", "usd_bid": 1200, "usd_sell": 1500,
          "buy": 100.0, "src": "skinport", "qty": 4, "depth": 30,
-         "blevels": 7, "buys": 900, "sells": 80, "ts": now},
+         "blevels": 7, "buys": 900, "sells": 80, "ts": now,
+         "bsp": 100.0, "bwp": 104.5, "qsp": 4, "qwp": 9, "vol": 37},
         {"n": "No Bid", "usd_bid": 0, "usd_sell": 300,
          "buy": 20.0, "src": "waxpeer", "qty": 2, "depth": 0,
          "blevels": 0, "buys": 0, "sells": 5, "ts": now},
@@ -644,6 +645,13 @@ def t_merge_real():
               abs((p.get("net") or 0) - 70.99) < 0.02, str(p.get("net")))
         check("面值比 = 净得 ÷ 买入价",
               abs((p.get("ratio") or 0) - 0.7099) < 0.001, str(p.get("ratio")))
+        check("两家平台的原始报价都导出了（多平台同屏要用）",
+              p.get("bsp") == 100.0 and p.get("bwp") == 104.5,
+              f"{p.get('bsp')} / {p.get('bwp')}")
+        check("平台各自的库存也带出来了",
+              p.get("qsp") == 4 and p.get("qwp") == 9,
+              f"{p.get('qsp')} / {p.get('qwp')}")
+        check("24 小时成交量传到了导出", p.get("vol") == 37, str(p.get("vol")))
         check("挂单价比求购价高，面值比也更大",
               (p.get("sell") or 0) > (p.get("bid") or 0)
               and (p.get("ratio_sell") or 0) > (p.get("ratio") or 0),
@@ -662,6 +670,41 @@ def t_merge_real():
     finally:
         steam.market_factor = real_factor
         run.DATA = old_data
+
+
+def t_platform():
+    """多平台同屏的数据来源：两家平台各自的报价都要留下。
+
+    只留「谁更便宜」是不够的 —— 页面上要写「Skinport ¥9（2 件）/
+    Waxpeer ¥10（5 件）」，才看得出便宜多少、另一家有没有货。
+    """
+    print("\n平台分价")
+    wax = {
+        "A": {"buy_cny": 10.0, "steam_mid_cny": 20.0, "qty": 5,
+              "type": "Rifle", "rarity": "Covert"},
+        "B": {"buy_cny": 8.0, "steam_mid_cny": 16.0, "qty": 3,
+              "type": "Pistol", "rarity": "Classified"},
+        "Sticker | Foo": {"buy_cny": 5.0, "steam_mid_cny": 9.0, "qty": 99,
+                          "type": "Sticker", "rarity": "High"},
+    }
+    skin = {"A": {"buy_cny": 9.0, "qty": 2}}
+    rows = {r["name"]: r for r in thirdparty.merge(wax, skin)}
+
+    a = rows.get("A") or {}
+    check("取更便宜那家当买入价", a.get("buy_cny") == 9.0 and a.get("src") == "skinport",
+          f"{a.get('buy_cny')} / {a.get('src')}")
+    check("两家报价都留着，不只是最低那个",
+          a.get("buy_skinport") == 9.0 and a.get("buy_waxpeer") == 10.0,
+          f"{a.get('buy_skinport')} / {a.get('buy_waxpeer')}")
+    check("平台各自的库存也留着",
+          a.get("qty_skinport") == 2 and a.get("qty_waxpeer") == 5,
+          f"{a.get('qty_skinport')} / {a.get('qty_waxpeer')}")
+
+    b = rows.get("B") or {}
+    check("另一家没货时写 None，不写 0（0 会被当成免费）",
+          b.get("buy_skinport") is None and b.get("buy_waxpeer") == 8.0,
+          f"{b.get('buy_skinport')} / {b.get('buy_waxpeer')}")
+    check("贴纸这类仍然被剔掉", "Sticker | Foo" not in rows)
 
 
 def t_sanity():
@@ -1218,6 +1261,7 @@ def main():
     t_migrate()
     t_merge()
     t_merge_real()
+    t_platform()
     t_sanity()
     t_shard_fx()
     t_net_give_up()

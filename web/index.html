@@ -39,6 +39,16 @@ h1{font-size:17px;margin:0;font-weight:600}
 .gun:hover{color:var(--txt)}
 .gun.on{color:var(--acc);border-color:var(--acc);background:#16212b}
 .dsc{font-weight:700;font-variant-numeric:tabular-nums}
+/* 流动性：差/中/好 三档，用颜色一眼扫过去就行，不用读数字 */
+.liq{display:inline-block;min-width:22px;text-align:center;font-size:11px;
+  padding:0 4px;border-radius:3px;border:1px solid;font-weight:600}
+.liq.l0{color:var(--down);border-color:#7a2e2e;background:#251416}
+.liq.l1{color:var(--warn);border-color:#6b4d10;background:#241d0d}
+.liq.l2{color:var(--up);border-color:#2c5f3c;background:#111f17}
+/* 平台报价：两家并排，更便宜那家加深 —— 只写「某处更便宜」等于没说 */
+.plat{font-size:11.5px;color:var(--dim);margin-right:7px;
+  font-variant-numeric:tabular-nums;white-space:nowrap}
+.plat.cheap{color:var(--txt);font-weight:600}
 .dscsmall{color:var(--dim);font-size:11.5px;margin-left:5px}
 .ago{color:var(--dim);font-size:11.5px}
 .ago.fresh{color:#5a8f6a}
@@ -286,14 +296,16 @@ tr.calcrow:hover td{background:var(--panel)}
     <thead><tr>
       <th class="name" data-k="n">物品</th>
       <th data-k="dsc">折<br><span style="font-weight:400" id="thGun">按求购价</span></th>
+      <th data-k="liq" class="hide-s">流动性</th>
       <th data-k="real">折现净额</th>
       <th data-k="buy">买入价</th>
+      <th class="hide-s">平台报价</th>
       <th data-k="net">Steam 净得</th>
       <th data-k="bid" class="hide-s">求购价</th>
       <th data-k="bid3" class="hide-s">稳定求购价</th>
       <th data-k="sell" class="hide-s">最低挂单</th>
       <th data-k="depth" class="hide-s">买盘深度</th>
-      <th data-k="qty" class="hide-s">第三方库存</th>
+      <th data-k="volK" class="hide-s">24h 成交</th>
       <th data-k="ts" class="hide-s">更新</th>
     </tr></thead>
     <tbody id="tb"></tbody>
@@ -310,6 +322,12 @@ tr.calcrow:hover td{background:var(--panel)}
     <b>折现净额</b> = Steam 净得 × 折现系数 − 买入价。余额不能直接变成现金，一般只能按 0.75~0.85 用掉，
     所以 8 折也可能不赚。折现系数那一栏上面写着<b>临界折</b>——
     折数高于它的行，不管看起来多便宜，折现之后都是亏的。<br>
+    <b>流动性</b> = 买盘深度、买单条数、挂单件数三项合成的一档：<b>好</b> 说明几件到几十件都吃得下，
+    <b>差</b> 说明买进来很可能卖不掉。估算行没有盘口，一律显示「—」。<br>
+    <b>平台报价</b> 是 Skinport / Waxpeer 各自挂的价和库存，加粗那家更便宜、买入价取的就是它 ——
+    同一件两家差个 3~5%，多看一眼就少花那几块钱。<br>
+    <b>24h 成交</b> 是 Steam 自己报的最近 24 小时成交件数。空着不是 0，是这一轮没拿到
+    （Steam 只在标定折算比时顺带返回成交量）。<br>
     <b>买盘深度</b> = 求购前 10 档能承接的件数。看着有价但深度只有几件，你的货就卖不掉。
     <b>更新</b> 那一列是这一行的盘口多久前抓的 —— 超过 30 分钟就别当实时。
     <b>★</b> 收藏会存在你自己的浏览器里，换设备不同步。<br>
@@ -417,11 +435,17 @@ tr.calcrow:hover td{background:var(--panel)}
         </select></div>
       <div class="f"><label>单件最多花 ¥</label>
         <input type="number" id="cMaxOne" step="10" value="200"></div>
+      <div class="f"><label>钱要压几天（买进到钱回来）</label>
+        <input type="number" id="cDays" step="1" value="7"
+          title="第三方发货 1~2 天、Steam 挂单成交 1~5 天、余额用掉再几天。默认 7 天，别当成冷却期"></div>
     </div>
     <div>
       <div class="calcout" id="calcOut"></div>
       <div id="calcPlan"></div>
       <div class="legend" style="margin-top:16px">
+        <b>周转天数</b>：这笔钱从买进到真正能拿回来要几天 —— 卡资金的不是 Steam 的冷却，
+        是发货、挂单成交、余额用掉这几段。同样 10% 的利润，7 天转一圈和 30 天转一圈，
+        一年差好几倍，所以这里给一个年化，方便跟别的去处比。<br>
         <b>这个计算器在算什么</b>：给定一笔钱，从当前行情里挑出最划算的组合，
         告诉你大概能拿到多少余额、折成现金还剩多少、净赚多少。<br>
         <b>它是估算，不是承诺</b>：每件能买几件受第三方库存限制，
@@ -656,6 +680,47 @@ async function load(){
 
 function disc(){ const v = parseFloat($('fDisc').value); return isFinite(v) && v > 0 ? v : DISC_DEFAULT; }
 
+/* 流动性：挂刀最怕的不是「折数不好看」，是「看着便宜、买进来卖不掉」。
+   三个数手上都有（买盘前 10 档深度、买单条数、挂单件数），合成一档就好：
+   全都不够 = 差，两三个够了 = 好。估算行没有盘口，返回 null 显示「—」，
+   不能因为「没有数据」就给人一个「好」。 */
+function liqOf(it){
+  if(it.est) return null;
+  const d = it.depth, o = it.orders, s = it.sell_orders;
+  if(d == null && o == null && s == null) return null;
+  let n = 0;
+  if((d||0) >= 50) n++;
+  if((o||0) >= 500) n++;
+  if((s||0) >= 100) n++;
+  return n >= 2 ? 2 : (n === 1 ? 1 : 0);
+}
+const LIQ_TEXT = ['差', '中', '好'];
+const LIQ_TIP = [
+  '买盘浅、挂单也少 —— 买进来很可能卖不掉，或者只能降价甩',
+  '能卖，但一次别超过十来件',
+  '买盘和挂单都够厚，几件到几十件都吃得下',
+];
+
+/* 平台报价格：Skinport / Waxpeer 各挂多少、各有多少件，并排看。
+   只显示「更便宜那家」是没有用的 —— 看不出便宜多少，也看不出另一家还有没有货。 */
+function platCell(it){
+  const td = el('td', 'hide-s');
+  const sp = it.bsp, wp = it.bwp;
+  if(sp == null && wp == null){ td.textContent = '—'; return td; }
+  const both = sp != null && wp != null;
+  const cheap = !both ? null : (sp <= wp ? 'sp' : 'wp');
+  const one = (tag, v, q, isCheap) => {
+    const x = el('span', 'plat' + (isCheap ? ' cheap' : ''));
+    x.textContent = tag + (v == null ? ' —' : ' ¥' + fmt(v))
+                  + (q != null && q > 0 ? ` (${q})` : '');
+    return x;
+  };
+  td.appendChild(one('SP', sp, it.qsp, cheap === 'sp'));
+  td.appendChild(one('WP', wp, it.qwp, cheap === 'wp'));
+  td.title = 'Skinport / Waxpeer 各自的最低挂单价和库存；加粗的那家更便宜，买入价取的就是它';
+  return td;
+}
+
 /* ---- 筛选 ---- */
 function view(){
   const dMax = parseFloat($('fRatio').value);
@@ -688,6 +753,8 @@ function view(){
     .map(it => ({...it,
       // 排序用的键。折越小越划算，所以默认升序就是这个意思。
       dsc: dsc10(it) ?? Infinity,
+      liq: liqOf(it) ?? -1,
+      volK: it.vol ?? -1,
       real: (it.net != null && it.buy != null) ? it.net*d - it.buy : null}))
     .sort((a,b) => {
       // 估算的永远排在实测后面。不管按哪列排都一样 —— 估算没有真实盘口，
@@ -885,15 +952,33 @@ function render(){
 
     const tdReal = el('td', (it.real ?? 0) >= 0 ? 'good' : 'bad',
       (it.real===null?'—':((it.real>=0?'+':'') + fmt(it.real))));
+    // 流动性：差的行不藏，但标出来 —— 有人就是愿意为折扣赌一把，得让他知道在赌
+    const lq = liqOf(it);
+    const tdLq = el('td', 'hide-s');
+    if(lq == null){
+      tdLq.textContent = '—';
+      tdLq.title = it.est ? '估算行没有真实盘口，判断不了卖不卖得掉' : '这轮没抓到盘口深度';
+    }else{
+      tdLq.appendChild(el('span', 'liq l' + lq, LIQ_TEXT[lq]));
+      tdLq.title = LIQ_TIP[lq] + `（买盘深度 ${it.depth ?? '—'} 件 / 买单 ${it.orders ?? '—'} 条 / 挂单 ${it.sell_orders ?? '—'} 件）`;
+    }
+    tr.appendChild(tdLq);
+
     tr.appendChild(tdReal);
 
     tr.appendChild(el('td', null, '¥'+fmt(it.buy)));
+    tr.appendChild(platCell(it));
     tr.appendChild(el('td', null, '¥'+fmt(it.net)));
     tr.appendChild(el('td','hide-s', it.bid ? '¥'+fmt(it.bid) : '—'));
     tr.appendChild(el('td','hide-s', it.bid3 ? '¥'+fmt(it.bid3) : '—'));
     tr.appendChild(el('td','hide-s', it.sell ? '¥'+fmt(it.sell) : '—'));
     tr.appendChild(el('td','hide-s', it.depth != null ? String(it.depth) : '—'));
-    tr.appendChild(el('td','hide-s', it.qty != null ? String(it.qty) : '—'));
+    // 24 小时成交量：Steam 给的，拿不到就是空。空不等于 0 —— 空是「不知道」，
+    // 0 是「没人买」。两个意思天差地别，所以这里不做成 0。
+    const tdVol = el('td', 'hide-s', it.vol ? String(it.vol) : '—');
+    tdVol.title = it.vol ? 'Steam 最近 24 小时成交件数'
+                         : '这一轮没拿到成交量（Steam 只在标定折算比时顺带返回），不是 0';
+    tr.appendChild(tdVol);
     // 这一行多久前抓的：挂刀最怕拿半小时前的盘口下单
     tr.appendChild(el('td', 'hide-s', agoOf(it.ts)));
     frag.appendChild(tr);
@@ -922,7 +1007,8 @@ function exportCsv(){
   const head = ['物品','物品_英文原名',`折（${GUNS[GUN].label}）`,'临界折',
                 '折现净额','买入价','Steam净得',
                 '折_求购价','折_稳定求购','折_寄售',
-                '求购价','稳定求购价','最低挂单','买盘深度','第三方库存',
+                '求购价','稳定求购价','最低挂单','买盘深度','流动性',
+                '24小时成交','Skinport价','Skinport库存','Waxpeer价','Waxpeer库存',
                 '数据源','更新','实测还是估算'];
   const dc = r => { const x = dsc10(r); return x == null ? '' : fmt(x, 2); };
   const out = [head.map(csvCell).join(',')];
@@ -936,7 +1022,9 @@ function exportCsv(){
       r.ratio_sell!=null?dc({ratio:r.ratio_sell}):'',
       r.bid!=null?fmt(r.bid,2):'', r.bid3!=null?fmt(r.bid3,2):'',
       r.sell!=null?fmt(r.sell,2):'',
-      r.depth ?? '', r.qty ?? '', r.src || '', agoOf(r.ts),
+      r.depth ?? '', (() => { const q = liqOf(r); return q == null ? '' : LIQ_TEXT[q]; })(),
+      r.vol ?? '', r.bsp ?? '', r.qsp ?? '', r.bwp ?? '', r.qwp ?? '',
+      r.src || '', agoOf(r.ts),
       r.est ? '估算（没抓到盘口）' : '实测'
     ].map(csvCell).join(','));
   }
@@ -1087,7 +1175,8 @@ function renderRank(){
     meta.appendChild(el('span', it.cash >= 0 ? 'good' : 'bad', cashTxt));
     const depthTxt = it.depth == null ? '—' : it.depth + ' 件';
     meta.appendChild(el('span', 'sub',
-      `买盘深度 ${depthTxt} · 第三方库存 ${it.qty ?? '—'} 件 · ${it.src || '—'}`
+      `流动性 ${liqOf(it) == null ? '—' : LIQ_TEXT[liqOf(it)]} · 买盘深度 ${depthTxt}`
+      + ` · 第三方库存 ${it.qty ?? '—'} 件 · ${it.src || '—'}`
       + ` · 更新 ${agoOf(it.ts)}`));
     body.appendChild(meta);
     card.appendChild(body);
@@ -1476,6 +1565,8 @@ function renderCalc(){
   const want = (isFinite(wantRaw) && wantRaw > 0) ? wantRaw : 0;
   const cashRaw = parseFloat($('cCash').value);
   const budget = (isFinite(cashRaw) && cashRaw > 0) ? cashRaw : 500;
+  const daysRaw = parseFloat($('cDays').value);
+  const days = (isFinite(daysRaw) && daysRaw > 0) ? daysRaw : 7;
 
   const rows = calcPool().filter(it => (it.buy ?? 0) <= maxOne);
   const plan = [];
@@ -1508,6 +1599,7 @@ function renderCalc(){
     w.appendChild(el('i', null, k));
     w.appendChild(el('b', cls, v));
     out.appendChild(w);
+    return w;
   };
   const cashValue = face * d;
   const pnl = cashValue - spent;
@@ -1522,6 +1614,16 @@ function renderCalc(){
   cell('回报率', n2(spent > 0 ? ((pnl / spent) * 100).toFixed(1) + '%' : '—'),
        dash ? null : (pnl >= 0 ? 'good' : 'bad'));
   cell('平均折', n2(face > 0 ? fmt(spent / face * 10, 2) + ' 折' : '—'));
+  // 年化：把这一轮的回报率按「一年能转几圈」复利放大。
+  // 亏钱时不给数字：复利会把 -26% 算成 -100%，看着像「本金亏光了」，
+  // 其实是「一年一直这么亏才会亏光」。这种夸张不如不给，回报率那格已经说清了。
+  const ann = (spent > 0 && pnl >= 0 && days > 0)
+    ? Math.pow(1 + pnl / spent, 365 / days) - 1 : null;
+  const annCell = cell(`年化（${fmt(days, 0)} 天一轮）`,
+       n2(ann == null ? '—' : '+' + fmt(ann * 100, 0) + '%'),
+       ann == null ? null : 'good');
+  if(ann == null && rows.length && pnl < 0)
+    annCell.querySelector('b').title = '这一轮是亏的，不折算年化 —— 折算出来会变成 -100%，那是夸张不是信息';
   if(want > 0) cell('离目标还差', n2('¥' + fmt(Math.max(0, want - face))));
   else cell('预算还剩', n2('¥' + fmt(Math.max(0, budget - spent))));
 
@@ -1661,7 +1763,7 @@ $('cDisc').addEventListener('input', () => {
   $(id).addEventListener('input', renderRank));
 ['rOnlyWin', 'rSafe'].forEach(id =>
   $(id).addEventListener('change', renderRank));
-['cCash', 'cWant', 'cMaxOne'].forEach(id =>
+['cCash', 'cWant', 'cMaxOne', 'cDays'].forEach(id =>
   $(id).addEventListener('input', renderCalc));
 $('cPool').addEventListener('change', renderCalc);
 
